@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 import signal
+import sqlite3
 import socketserver
 import subprocess
 import tempfile
@@ -155,6 +156,10 @@ class RunnerTests(unittest.TestCase):
 
         self._write_file(self.profiles_dir / "review-readonly.toml", 'command = ["/usr/bin/true"]\ntimeout_seconds = 30\n')
         self._write_file(self.profiles_dir / "backend-unit.toml", 'command = ["/usr/bin/true"]\ntimeout_seconds = 30\n')
+        self._write_file(
+            self.profiles_dir / "git-sync-verify.toml",
+            'command = ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"]\ntimeout_seconds = 30\n',
+        )
 
         self.config_path = self._write_config()
         self.config = runner.RunnerConfig.load(self.config_path)
@@ -169,7 +174,7 @@ class RunnerTests(unittest.TestCase):
 
     def _copy_fixture(self, name: str) -> None:
         repository_root = Path(__file__).resolve().parents[1]
-        source = repository_root / ("schemas" if name.endswith("_schema.json") else "") / name
+        source = repository_root / "schemas" / name if name.endswith("_schema.json") else repository_root / name
         target = self.app_dir / name
         target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -190,7 +195,7 @@ class RunnerTests(unittest.TestCase):
         return self._run("git", "-C", str(repo), *args, env=env).stdout.strip()
 
     def _init_repo(self) -> None:
-        self._run("git", "init", "--bare", str(self.origin))
+        self._run("git", "init", "--bare", "--initial-branch=main", str(self.origin))
         self._run("git", "clone", str(self.origin), str(self.repo))
         env = {
             **os.environ,
@@ -209,7 +214,38 @@ class RunnerTests(unittest.TestCase):
         self.target_sha = self._git(self.repo, "rev-parse", "HEAD")
         self._run("git", "-C", str(self.repo), "push", "origin", "HEAD", env=env)
 
-    def _write_config(self, *, allow_write_tasks: bool = True, model: str = "", max_diff_bytes: int = 4096) -> Path:
+    def _commit_repo_file(self, relative_path: str, content: str, message: str) -> str:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        target = self.repo / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        self._run("git", "-C", str(self.repo), "add", relative_path, env=env)
+        self._run("git", "-C", str(self.repo), "commit", "-m", message, env=env)
+        sha = self._git(self.repo, "rev-parse", "HEAD")
+        self._run("git", "-C", str(self.repo), "push", "origin", "HEAD", env=env)
+        return sha
+
+    def _prepare_sync_repo(self) -> None:
+        self._run("git", "-C", str(self.repo), "checkout", "main")
+        self._run("git", "-C", str(self.repo), "reset", "--hard", self.base_sha)
+
+    def _write_config(
+        self,
+        *,
+        allow_write_tasks: bool = True,
+        model: str = "",
+        max_diff_bytes: int = 4096,
+        owner_pubkey: str = "",
+        extra_capabilities: str = "",
+        capability_bindings: str = "",
+        sensitive_paths: str = '[".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials/*", "secrets/*"]',
+    ) -> Path:
         config_path = self.app_dir / "config.toml"
         config = textwrap.dedent(
             f"""
@@ -225,6 +261,8 @@ class RunnerTests(unittest.TestCase):
             max_changed_files = 2
             max_diff_bytes = {max_diff_bytes}
             active_lease_seconds = 2
+            service_label = "com.example.mac-runner"
+            owner_pubkey = "{owner_pubkey}"
 
             [ollama]
             endpoint = "{self.endpoint}"
@@ -240,13 +278,22 @@ class RunnerTests(unittest.TestCase):
 
             [capabilities]
             image_generation = false
+            git = true
+            {extra_capabilities}
 
             [repos.repo1]
             path = "{self.repo}"
             fetch_remote = "origin"
-            test_profiles = ["review-readonly", "backend-unit"]
+            test_profiles = ["review-readonly", "backend-unit", "git-sync-verify"]
+            sensitive_paths = {sensitive_paths}
+            sync_enabled = true
+            canonical_remote_url = "{self.origin}"
+            sync_remote = "origin"
+            sync_branch = "main"
             """
         ).strip()
+        if capability_bindings:
+            config = config + "\n\n" + textwrap.dedent(capability_bindings).strip() + "\n"
         config_path.write_text(config, encoding="utf-8")
         return config_path
 
@@ -308,10 +355,54 @@ class RunnerTests(unittest.TestCase):
         payload.update(overrides)
         return payload
 
+    def _sync_job(self, **overrides: object) -> dict[str, object]:
+        payload = self._job(
+            job_id="sync-job",
+            task_type="sync",
+            focus=["git-sync", "exact-sha-verification", "clean-worktree-safety"],
+            write=True,
+            allowed_paths=["."],
+            test_profile="git-sync-verify",
+            execution_route="ornith-then-codex",
+            preferred_worker="ornith",
+            required_capabilities=["git"],
+            summary="Synchronize the configured checkout.",
+            instructions="Audit text only and never command input.",
+            acceptance_criteria=["Exact target SHA"],
+            metadata={
+                "remote_url": "https://example.invalid/audit-only.git",
+                "branch": "audit-only",
+                "source_channel_id": "channel",
+                "source_event_id": "event",
+            },
+        )
+        payload.update(overrides)
+        return payload
+
     def _runner(self, *, allow_write_tasks: bool = True, model: str = "", max_diff_bytes: int = 4096) -> runner.Runner:
         config = runner.RunnerConfig.load(self._write_config(allow_write_tasks=allow_write_tasks, model=model, max_diff_bytes=max_diff_bytes))
         self.config = config
         return runner.Runner(config)
+
+    def _policy_v2_job(self, **overrides: object) -> dict[str, object]:
+        payload = self._job()
+        payload.pop("write", None)
+        payload.pop("allowed_paths", None)
+        payload.pop("test_profile", None)
+        payload.update(
+            {
+                "policy_version": 2,
+                "permission_profile": "observe",
+                "capabilities": [],
+                "scope": {"root": "worktree", "paths": []},
+                "network": {"mode": "none"},
+                "verification_profiles": ["review-readonly"],
+                "context": {"source": "test"},
+                "extensions": {"trace": "keep"},
+            }
+        )
+        payload.update(overrides)
+        return payload
 
     def _codex_entries(self) -> list[dict[str, object]]:
         if not self.codex_log.exists():
@@ -355,7 +446,11 @@ if task == "decide_route":
     payload = {{"route": "codex" if job.get("write") else "ornith", "reason": "fake route"}}
 elif task == "execute_job":
     if job.get("write"):
-        target = Path(job["allowed_paths"][0])
+        allowed_paths = job.get("allowed_paths") or []
+        if job.get("job_id") == "sensitive-write":
+            target = Path(".env")
+        else:
+            target = Path(allowed_paths[0]) if allowed_paths else Path("README.md")
         target.write_text("changed by fake codex\\n", encoding="utf-8")
         if job.get("job_id") == "escape-write":
             Path("outside.txt").write_text("outside\\n", encoding="utf-8")
@@ -411,6 +506,826 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         )
         self.assertEqual(unavailable["status"], "REJECTED")
         self.assertEqual(unavailable["error"]["code"], "capability_unavailable")
+        subject.close()
+
+    def test_sync_happy_path_is_deterministic_and_model_free(self) -> None:
+        self._prepare_sync_repo()
+        subject = self._runner()
+        submitted = subject.submit(self._sync_job())
+        self.assertEqual(submitted["status"], "VALIDATED")
+        git_commands: list[list[str]] = []
+        original_run_command = runner.run_command
+
+        def record_command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            git_commands.append(args)
+            return original_run_command(args, **kwargs)
+
+        with mock.patch.object(runner, "run_command", side_effect=record_command):
+            result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "DONE")
+        self.assertEqual(result["route"], "sync")
+        self.assertEqual(result["result"]["route"], "sync")
+        self.assertEqual(result["result"]["commit_sha"], self.target_sha)
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.target_sha)
+        self.assertEqual(self._git(self.repo, "rev-parse", "refs/remotes/origin/main"), self.target_sha)
+        self.assertEqual(self._git(self.repo, "branch", "--show-current"), "main")
+        self.assertEqual(self._git(self.repo, "status", "--porcelain=v1", "--untracked-files=all"), "")
+        self.assertEqual(self._codex_entries(), [])
+        flattened = [token for command in git_commands for token in command]
+        for forbidden in ("push", "reset", "clean", "checkout", "tag", "--force", "-f"):
+            self.assertNotIn(forbidden, flattened)
+        self.assertNotIn("https://example.invalid/audit-only.git", flattened)
+        states = [
+            row[0]
+            for row in subject.ledger.conn.execute(
+                "SELECT state FROM job_events WHERE job_id = ? AND attempt = ? ORDER BY id",
+                ("sync-job", 1),
+            ).fetchall()
+        ]
+        self.assertEqual(states, ["RECEIVED", "VALIDATED", "SUPERVISING", "PREPARING", "RUNNING", "VERIFYING", "DONE"])
+        subject.close()
+
+    def test_sync_dirty_worktree_fails_without_moving_head(self) -> None:
+        self._prepare_sync_repo()
+        (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        subject = self._runner()
+        self.assertEqual(subject.submit(self._sync_job())["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "dirty_worktree")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_wrong_remote_fails_without_fetch_or_checkout_update(self) -> None:
+        self._prepare_sync_repo()
+        wrong_origin = self.root / "wrong-origin.git"
+        self._run("git", "init", "--bare", "--initial-branch=main", str(wrong_origin))
+        self._run("git", "-C", str(self.repo), "remote", "set-url", "origin", str(wrong_origin))
+        subject = self._runner()
+        self.assertEqual(subject.submit(self._sync_job())["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "wrong_remote")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_wrong_branch_fails_without_checkout_update(self) -> None:
+        self._prepare_sync_repo()
+        self._run("git", "-C", str(self.repo), "checkout", "-b", "other")
+        subject = self._runner()
+        self.assertEqual(subject.submit(self._sync_job())["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "wrong_branch")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_base_mismatch_fails_without_checkout_update(self) -> None:
+        self._prepare_sync_repo()
+        subject = self._runner()
+        job = self._sync_job(base_sha=self.target_sha)
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "base_mismatch")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_target_mismatch_fails_without_checkout_update(self) -> None:
+        self._prepare_sync_repo()
+        subject = self._runner()
+        job = self._sync_job(target_sha=self.base_sha)
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "target_mismatch")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_divergence_is_rejected_as_non_fast_forward(self) -> None:
+        self._prepare_sync_repo()
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        (self.repo / "local.txt").write_text("local divergence\n", encoding="utf-8")
+        self._run("git", "-C", str(self.repo), "add", "local.txt", env=env)
+        self._run("git", "-C", str(self.repo), "commit", "-m", "local divergence", env=env)
+        divergent_sha = self._git(self.repo, "rev-parse", "HEAD")
+        subject = self._runner()
+        job = self._sync_job(base_sha=divergent_sha)
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "non_fast_forward")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), divergent_sha)
+        subject.close()
+
+    def test_sync_fetch_failure_is_structured_and_does_not_move_head(self) -> None:
+        self._prepare_sync_repo()
+        missing_origin = self.root / "origin-unavailable.git"
+        self.origin.rename(missing_origin)
+        subject = self._runner()
+        self.assertEqual(subject.submit(self._sync_job())["status"], "VALIDATED")
+        result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "fetch_failed")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_repo_lock_rejects_concurrent_execution(self) -> None:
+        self._prepare_sync_repo()
+        subject = self._runner()
+        self.assertEqual(subject.submit(self._sync_job())["status"], "VALIDATED")
+        repo_config = subject.worktrees.repo("repo1")
+        with subject.sync.lock(repo_config):
+            result = subject.execute("sync-job", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "repo_sync_busy")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        subject.close()
+
+    def test_sync_verifying_state_resumes_idempotently_without_model_routing(self) -> None:
+        self._prepare_sync_repo()
+        subject = self._runner()
+        self.assertEqual(subject.submit(self._sync_job(job_id="sync-resume"))["status"], "VALIDATED")
+        previous = "VALIDATED"
+        for state in ("SUPERVISING", "PREPARING", "RUNNING", "VERIFYING"):
+            subject.ledger.transition("sync-resume", 1, {previous}, state, route="sync", lease_expires=0.0)
+            previous = state
+        result = subject.execute("sync-resume", 1)
+        self.assertEqual(result["status"], "DONE")
+        self.assertEqual(result["result"]["route"], "sync")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.target_sha)
+        self.assertEqual(self._codex_entries(), [])
+        subject.close()
+
+    def test_sync_dry_run_accepts_sender_audit_fields_without_ledger_or_git_mutation(self) -> None:
+        self._prepare_sync_repo()
+        subject = self._runner()
+        result = subject.validate_dry_run(self._sync_job(attempt=2))
+        self.assertEqual(result["status"], "VALIDATED")
+        self.assertTrue(result["dry_run"])
+        with self.assertRaises(runner.RunnerError) as error:
+            subject.get("sync-job", 2)
+        self.assertEqual(error.exception.code, "job_not_found")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        self.assertEqual(self._codex_entries(), [])
+        subject.close()
+
+    def test_policy_v2_sync_accepts_root_scope_without_paths_and_records_wire_hash(self) -> None:
+        self._prepare_sync_repo()
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="sync-registered-repo = true",
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="sync-v2",
+            task_type="sync",
+            permission_profile="operational",
+            capabilities=["sync-registered-repo"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "declared-remotes-and-registries"},
+            verification_profiles=["git-sync-verify"],
+            execution_route="auto",
+        )
+        submitted = subject.submit(job)
+        self.assertEqual(submitted["status"], "VALIDATED")
+        result = subject.execute("sync-v2", 1)
+        self.assertEqual(result["status"], "DONE")
+        stored = subject.get("sync-v2", 1)
+        self.assertEqual(stored["payload"]["permission_profile"], "operational")
+        self.assertEqual(stored["payload"]["capabilities"], ["sync-registered-repo"])
+        self.assertRegex(stored["wire_payload_hash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(stored["wire_payload"]["scope"]["paths"], [])
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.target_sha)
+        subject.close()
+
+    def test_policy_v2_dry_run_rejects_unknown_top_level_field(self) -> None:
+        subject = self._runner()
+        payload = self._policy_v2_job(unexpected_top_level_field="rejected")
+        with self.assertRaises(runner.RunnerError) as error:
+            subject.validate_dry_run(payload)
+        self.assertEqual(error.exception.code, "schema_validation_failed")
+        subject.close()
+
+    def test_policy_v2_network_modes_and_privileged_owner_approval_are_strict(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="\n".join(
+                    [
+                        "sync-registered-repo = true",
+                        "push-task-branch = true",
+                        "restart-user-service = true",
+                    ]
+                ),
+                capability_bindings="""
+                [capability_bindings.push-task-branch]
+                remote = "origin"
+                allowed_branch_prefixes = ["job/"]
+                protected_branch_prefixes = ["main", "master", "release/"]
+
+                [capability_bindings.restart-user-service]
+                service_labels = ["com.example.mac-runner"]
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        relay_sync = subject.submit(
+            self._policy_v2_job(
+                job_id="sync-relay",
+                task_type="sync",
+                permission_profile="operational",
+                capabilities=["sync-registered-repo"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "relay-only"},
+                verification_profiles=["git-sync-verify"],
+            )
+        )
+        self.assertEqual(relay_sync["status"], "REJECTED")
+        self.assertEqual(relay_sync["error"]["code"], "network_not_allowed")
+
+        restart_bad_network = subject.submit(
+            self._policy_v2_job(
+                job_id="restart-bad-network",
+                permission_profile="operational",
+                capabilities=["restart-user-service"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+            )
+        )
+        self.assertEqual(restart_bad_network["status"], "REJECTED")
+        self.assertEqual(restart_bad_network["error"]["code"], "network_not_allowed")
+
+        summary = "capability=push-task-branch;repo=repo1;job=push-priv;attempt=1;branch=job/push-priv"
+        privileged_ok = subject.validate_dry_run(
+            self._policy_v2_job(
+                job_id="push-priv",
+                permission_profile="privileged",
+                capabilities=["push-task-branch"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+                owner_approval={
+                    "approved_by": "1" * 64,
+                    "approval_ref": "oa-event-1",
+                    "approved_at": "2026-08-23T10:00:00+09:00",
+                    "summary": summary,
+                },
+            )
+        )
+        self.assertEqual(privileged_ok["status"], "VALIDATED")
+
+        future = subject.submit(
+            self._policy_v2_job(
+                job_id="push-priv-future",
+                permission_profile="privileged",
+                capabilities=["push-task-branch"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+                owner_approval={
+                    "approved_by": "1" * 64,
+                    "approval_ref": "oa-event-2",
+                    "approved_at": "2026-08-24T10:00:00+09:00",
+                    "summary": "capability=push-task-branch;repo=repo1;job=push-priv-future;attempt=1;branch=job/push-priv-future",
+                },
+            )
+        )
+        self.assertEqual(future["status"], "REJECTED")
+        self.assertEqual(future["error"]["code"], "invalid_owner_approval")
+
+        self_restart = subject.submit(
+            self._policy_v2_job(
+                job_id="restart-self",
+                permission_profile="operational",
+                capabilities=["restart-user-service"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "none"},
+                verification_profiles=["review-readonly"],
+            )
+        )
+        self.assertEqual(self_restart["status"], "VALIDATED")
+        failed = subject.execute("restart-self", 1)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "capability_not_configured")
+        subject.close()
+
+    def test_legacy_write_with_empty_allowed_paths_maps_to_full_worktree(self) -> None:
+        verify_code = "from pathlib import Path; raise SystemExit(0 if Path('README.md').read_text(encoding='utf-8').strip() == 'changed by fake codex' else 9)"
+        self._write_file(
+            self.profiles_dir / "backend-unit.toml",
+            f'command = ["python3", "-c", {json.dumps(verify_code)}]\ntimeout_seconds = 30\n',
+        )
+        subject = self._runner()
+        submitted = subject.submit(self._job(job_id="legacy-full-write", write=True, allowed_paths=[], test_profile="backend-unit"))
+        self.assertEqual(submitted["status"], "VALIDATED")
+        result = subject.execute("legacy-full-write", 1)
+        self.assertEqual(result["status"], "DONE")
+        self.assertRegex(result["result"]["commit_sha"], r"^[0-9a-f]{40}$")
+        subject.close()
+
+    def test_observe_rejects_target_commit_with_sensitive_tracked_path(self) -> None:
+        secret_sha = self._commit_repo_file(".env", "TOKEN=secret\n", "add secret")
+        subject = self._runner()
+        rejected = subject.submit(self._job(job_id="sensitive-observe", target_sha=secret_sha))
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["error"]["code"], "sensitive_path_present")
+        subject.close()
+
+    def test_operational_rejects_target_commit_with_sensitive_tracked_path_before_side_effects(self) -> None:
+        secret_sha = self._commit_repo_file("credentials/api.txt", "secret\n", "add credential")
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="push-task-branch = true",
+                capability_bindings="""
+                [capability_bindings.push-task-branch]
+                remote = "origin"
+                allowed_branch_prefixes = ["job/"]
+                protected_branch_prefixes = ["main", "master", "release/"]
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        rejected = subject.submit(
+            self._policy_v2_job(
+                job_id="sensitive-operational",
+                target_sha=secret_sha,
+                permission_profile="operational",
+                capabilities=["push-task-branch"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+            )
+        )
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["error"]["code"], "sensitive_path_present")
+        subject.close()
+
+    def test_standard_write_rejects_modified_sensitive_path(self) -> None:
+        verify_code = "raise SystemExit(0)"
+        self._write_file(
+            self.profiles_dir / "backend-unit.toml",
+            f'command = ["python3", "-c", {json.dumps(verify_code)}]\ntimeout_seconds = 30\n',
+        )
+        subject = self._runner()
+        submitted = subject.submit(self._job(job_id="sensitive-write", write=True, allowed_paths=[".env"], test_profile="backend-unit"))
+        self.assertEqual(submitted["status"], "VALIDATED")
+        result = subject.execute("sensitive-write", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "sensitive_path_present")
+        subject.close()
+
+    def test_sensitive_path_patterns_do_not_reject_normal_files(self) -> None:
+        subject = self._runner()
+        accepted = subject.submit(self._job(job_id="normal-file-job", target_sha=self.target_sha))
+        self.assertEqual(accepted["status"], "VALIDATED")
+        subject.close()
+
+    def test_push_task_branch_is_deterministic_and_no_force(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="push-task-branch = true",
+                capability_bindings="""
+                [capability_bindings.push-task-branch]
+                remote = "origin"
+                allowed_branch_prefixes = ["job/"]
+                protected_branch_prefixes = ["main", "master", "release/"]
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="push-task",
+            permission_profile="operational",
+            capabilities=["push-task-branch"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "declared-remotes-and-registries"},
+            verification_profiles=["review-readonly"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        result = subject.execute("push-task", 1)
+        self.assertEqual(result["status"], "DONE")
+        self.assertIn("job/push-task", self._git(self.origin, "for-each-ref", "--format=%(refname:short)", "refs/heads"))
+        expected_hash = runner.sha256_hex(
+            runner.canonical_json_bytes({"remote": "origin", "branch": "job/push-task", "commit_sha": self.target_sha})
+        )
+        self.assertEqual(result["result"]["diff_hash"], expected_hash)
+
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        shadow = self.root / "shadow"
+        self._run("git", "clone", str(self.origin), str(shadow))
+        (shadow / "shadow.txt").write_text("shadow\n", encoding="utf-8")
+        self._run("git", "-C", str(shadow), "checkout", "-b", "job/push-force", env=env)
+        self._run("git", "-C", str(shadow), "add", "shadow.txt", env=env)
+        self._run("git", "-C", str(shadow), "commit", "-m", "shadow", env=env)
+        self._run("git", "-C", str(shadow), "push", "origin", "job/push-force", env=env)
+
+        rejected = subject.submit(
+            self._policy_v2_job(
+                job_id="push-force",
+                permission_profile="operational",
+                capabilities=["push-task-branch"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+                target_sha=self.target_sha,
+            )
+        )
+        self.assertEqual(rejected["status"], "VALIDATED")
+        failed = subject.execute("push-force", 1)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "push_requires_force")
+        subject.close()
+
+    def test_ledger_migrates_old_schema_in_place(self) -> None:
+        db_path = self.root / "state" / "runner.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+              job_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              route TEXT,
+              repo_id TEXT NOT NULL,
+              write_enabled INTEGER NOT NULL,
+              deadline_seconds INTEGER NOT NULL,
+              lease_expires REAL,
+              started_at REAL,
+              finished_at REAL,
+              result_json TEXT,
+              error_json TEXT,
+              created_at REAL NOT NULL,
+              updated_at REAL NOT NULL,
+              PRIMARY KEY (job_id, attempt)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, attempt INTEGER NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL, note_json TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        subject = self._runner()
+        columns = {row[1] for row in subject.ledger.conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        self.assertIn("wire_payload_json", columns)
+        self.assertIn("wire_payload_hash", columns)
+        self.assertIn("permission_profile", columns)
+        self.assertIn("network_mode", columns)
+        subject.close()
+
+    def test_legacy_job_rows_are_backfilled_and_replay_without_conflict(self) -> None:
+        db_path = self.root / "state" / "runner.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_payload = self._job(job_id="legacy-replay", attempt=3)
+        legacy_result = {
+            "job_id": "legacy-replay",
+            "attempt": 3,
+            "status": "DONE",
+            "route": "ornith",
+            "findings": [],
+            "test_exit_code": 0,
+            "diff_hash": "0" * 64,
+            "commit_sha": None,
+            "duration_seconds": 0.1,
+            "errors": [],
+            "supervisor": {
+                "decision": {"route": "ornith", "reason": "legacy"},
+                "acceptance": {"accepted": True, "summary": "ok", "errors": []},
+            },
+            "artifacts": {
+                "route_decision": "a",
+                "worker_result": "b",
+                "tests": "c",
+                "acceptance": "d",
+                "result": "e",
+            },
+        }
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+              job_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              route TEXT,
+              repo_id TEXT NOT NULL,
+              write_enabled INTEGER NOT NULL,
+              deadline_seconds INTEGER NOT NULL,
+              lease_expires REAL,
+              started_at REAL,
+              finished_at REAL,
+              result_json TEXT,
+              error_json TEXT,
+              created_at REAL NOT NULL,
+              updated_at REAL NOT NULL,
+              PRIMARY KEY (job_id, attempt)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, attempt INTEGER NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL, note_json TEXT)"
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (
+              job_id, attempt, payload_json, status, route, repo_id, write_enabled, deadline_seconds,
+              lease_expires, started_at, finished_at, result_json, error_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-replay",
+                3,
+                json.dumps(legacy_payload, sort_keys=True),
+                "DONE",
+                "ornith",
+                "repo1",
+                0,
+                30,
+                None,
+                1.0,
+                2.0,
+                json.dumps(legacy_result, sort_keys=True),
+                None,
+                1.0,
+                2.0,
+            ),
+        )
+        for state in ("RECEIVED", "VALIDATED", "DONE"):
+            conn.execute(
+                "INSERT INTO job_events (job_id, attempt, state, created_at, note_json) VALUES (?, ?, ?, ?, ?)",
+                ("legacy-replay", 3, state, 1.0, None),
+            )
+        conn.commit()
+        conn.close()
+        subject = self._runner()
+        replay = subject.submit(legacy_payload)
+        self.assertEqual(replay["status"], "DONE")
+        self.assertEqual(replay["result"]["status"], "DONE")
+        stored = subject.get("legacy-replay", 3)
+        self.assertEqual(stored["payload"]["policy_version"], 1)
+        self.assertEqual(stored["wire_payload"], legacy_payload)
+        self.assertEqual(
+            subject.ledger.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            subject.ledger.conn.execute("SELECT COUNT(*) FROM job_events WHERE job_id = 'legacy-replay' AND attempt = 3").fetchone()[0],
+            3,
+        )
+        subject.close()
+
+    def test_verification_profiles_run_in_order_and_artifact_records_each_result(self) -> None:
+        self._write_file(self.profiles_dir / "profile-first.toml", 'command = ["python3", "-c", "print(\'first\')"]\ntimeout_seconds = 30\n')
+        self._write_file(self.profiles_dir / "profile-second.toml", 'command = ["python3", "-c", "print(\'second\'); raise SystemExit(7)"]\ntimeout_seconds = 30\n')
+        config_path = self._write_config()
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8").replace(
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify"]',
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "profile-first", "profile-second"]',
+            ),
+            encoding="utf-8",
+        )
+        subject = runner.Runner(runner.RunnerConfig.load(config_path))
+        job = self._policy_v2_job(
+            job_id="multi-profiles",
+            permission_profile="observe",
+            verification_profiles=["profile-first", "profile-second"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        result = subject.execute("multi-profiles", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "test_profile_failed")
+        tests_artifact = json.loads((self.root / "share" / "artifacts" / "multi-profiles" / "1" / "tests.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["profile"] for item in tests_artifact["profiles"]], ["profile-first", "profile-second"])
+        self.assertEqual([item["exit_code"] for item in tests_artifact["profiles"]], [0, 7])
+        self.assertEqual([item["stdout"].strip() for item in tests_artifact["profiles"]], ["first", "second"])
+        self.assertEqual(tests_artifact["exit_code"], 7)
+        subject.close()
+
+    def test_assert_exact_commit_fetches_only_for_declared_network(self) -> None:
+        repo = self.config.repos["repo1"]
+        commands: list[list[str]] = []
+        original_run_command = runner.run_command
+
+        def record(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            return original_run_command(args, **kwargs)
+
+        subject = self._runner()
+        try:
+            with mock.patch.object(runner, "run_command", side_effect=record):
+                subject.worktrees.assert_exact_commit(repo, self.target_sha, network_mode="none")
+            self.assertFalse(any(command[:4] == ["git", "-C", str(repo.path), "fetch"] for command in commands))
+
+            commands.clear()
+            with mock.patch.object(runner, "run_command", side_effect=record):
+                subject.worktrees.assert_exact_commit(
+                    repo,
+                    self.target_sha,
+                    network_mode="declared-remotes-and-registries",
+                )
+            self.assertTrue(any(command[:4] == ["git", "-C", str(repo.path), "fetch"] for command in commands))
+        finally:
+            subject.close()
+
+    def test_manage_pr_verifies_branch_and_final_pr_state(self) -> None:
+        config_path = self._write_config(
+            extra_capabilities="manage-pr = true",
+            capability_bindings="""
+            [capability_bindings.manage-pr]
+            remote = "origin"
+            allowed_branch_prefixes = ["job/"]
+            protected_branch_prefixes = ["main", "master", "release/"]
+            """,
+        )
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8").replace(str(self.origin), "https://github.com/owner/repo.git"),
+            encoding="utf-8",
+        )
+        subject = runner.Runner(runner.RunnerConfig.load(config_path))
+        repo = subject.config.repos["repo1"]
+        payload = subject.validate_dry_run(
+            self._policy_v2_job(
+                job_id="pr-job",
+                permission_profile="operational",
+                capabilities=["manage-pr"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+                metadata={"source_channel_id": "chan", "source_event_id": "evt"},
+            )
+        )["payload"]
+        calls: list[list[str]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            if args[:6] == [runner.GIT_BIN, "-C", str(repo.path), "remote", "get-url", "--all"]:
+                return subprocess.CompletedProcess(args, 0, stdout="https://github.com/owner/repo.git\n", stderr="")
+            if args[:6] == [runner.GIT_BIN, "-C", str(repo.path), "ls-remote", "--heads", "origin"]:
+                return subprocess.CompletedProcess(args, 0, stdout=f"{self.target_sha}\trefs/heads/job/pr-job\n", stderr="")
+            if args[0].endswith("gh") and args[1:3] == ["pr", "view"] and "--json" in args:
+                if len([call for call in calls if call[:3] == ["/usr/local/bin/gh", "pr", "view"]]) == 1:
+                    return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
+                return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"number": 42, "url": "https://github.com/owner/repo/pull/42", "headRefName": "job/pr-job", "baseRefName": "main"}), stderr="")
+            if args[0].endswith("gh") and args[1:3] == ["pr", "create"]:
+                return subprocess.CompletedProcess(args, 0, stdout="https://github.com/owner/repo/pull/42\n", stderr="")
+            raise AssertionError(args)
+
+        with mock.patch.object(runner.shutil, "which", return_value="/usr/local/bin/gh"), mock.patch.object(runner, "run_command", side_effect=fake_run):
+            outcome = subject._capability_manage_pr(repo, payload, runner.Deadline(30))
+        self.assertEqual(outcome["result"]["pr_number"], 42)
+        self.assertEqual(outcome["result"]["pr_url"], "https://github.com/owner/repo/pull/42")
+        self.assertTrue(any(args[:6] == [runner.GIT_BIN, "-C", str(repo.path), "ls-remote", "--heads", "origin"] for args in calls))
+        subject.close()
+
+    def test_restart_user_service_requires_pid_change_and_summarizes_only(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="restart-user-service = true",
+                capability_bindings="""
+                [capability_bindings.restart-user-service]
+                service_labels = ["com.example.buzz-acp"]
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        calls: list[list[str]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            if args[:2] == ["launchctl", "print"]:
+                if len([call for call in calls if call[:2] == ["launchctl", "print"]]) == 1:
+                    return subprocess.CompletedProcess(args, 0, stdout="state = running\npid = 123\n", stderr="")
+                return subprocess.CompletedProcess(args, 0, stdout="state = running\npid = 456\n", stderr="")
+            if args[:2] == ["launchctl", "kickstart"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            raise AssertionError(args)
+
+        payload = self._policy_v2_job(
+            job_id="restart-service",
+            permission_profile="operational",
+            capabilities=["restart-user-service"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "none"},
+            verification_profiles=["review-readonly"],
+        )
+        with mock.patch.object(runner, "run_command", side_effect=fake_run):
+            result = subject._capability_restart_user_service(payload, runner.Deadline(30))
+        self.assertEqual(result["result"]["before_pid"], 123)
+        self.assertEqual(result["result"]["after_pid"], 456)
+        self.assertNotIn("state = running", json.dumps(result))
+        subject.close()
+
+    def test_capability_verification_failure_does_not_dispatch_side_effects(self) -> None:
+        self._write_file(self.profiles_dir / "profile-fail.toml", 'command = ["python3", "-c", "raise SystemExit(9)"]\ntimeout_seconds = 30\n')
+        config_path = self._write_config(
+            extra_capabilities="push-task-branch = true",
+            capability_bindings="""
+            [capability_bindings.push-task-branch]
+            remote = "origin"
+            allowed_branch_prefixes = ["job/"]
+            protected_branch_prefixes = ["main", "master", "release/"]
+            """,
+        )
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8").replace(
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify"]',
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "profile-fail"]',
+            ),
+            encoding="utf-8",
+        )
+        subject = runner.Runner(runner.RunnerConfig.load(config_path))
+        job = self._policy_v2_job(
+            job_id="capability-verify-fail",
+            permission_profile="operational",
+            capabilities=["push-task-branch"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "declared-remotes-and-registries"},
+            verification_profiles=["profile-fail"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        with mock.patch.object(subject, "_dispatch_capability", side_effect=AssertionError("dispatch must not run")):
+            result = subject.execute("capability-verify-fail", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "test_profile_failed")
+        states = [
+            row[0]
+            for row in subject.ledger.conn.execute(
+                "SELECT state FROM job_events WHERE job_id = ? AND attempt = ? ORDER BY id",
+                ("capability-verify-fail", 1),
+            ).fetchall()
+        ]
+        self.assertEqual(states, ["RECEIVED", "VALIDATED", "SUPERVISING", "PREPARING", "FAILED"])
+        subject.close()
+
+    def test_capability_cancelled_before_running_does_not_dispatch(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="push-task-branch = true",
+                capability_bindings="""
+                [capability_bindings.push-task-branch]
+                remote = "origin"
+                allowed_branch_prefixes = ["job/"]
+                protected_branch_prefixes = ["main", "master", "release/"]
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="capability-cancel-race",
+            permission_profile="operational",
+            capabilities=["push-task-branch"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "declared-remotes-and-registries"},
+            verification_profiles=["review-readonly"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        original_assert = subject._assert_not_cancelled
+        call_count = {"value": 0}
+
+        def cancel_on_second_check(job_id: str, attempt: int) -> None:
+            call_count["value"] += 1
+            if call_count["value"] == 2:
+                subject.ledger.transition(job_id, attempt, {"PREPARING"}, "CANCELLED")
+            return original_assert(job_id, attempt)
+
+        with mock.patch.object(subject, "_assert_not_cancelled", side_effect=cancel_on_second_check), mock.patch.object(
+            subject, "_dispatch_capability", side_effect=AssertionError("dispatch must not run")
+        ):
+            result = subject.execute("capability-cancel-race", 1)
+        self.assertEqual(result["status"], "CANCELLED")
+        subject.close()
+
+    def test_sync_is_default_deny_when_repo_is_not_enabled(self) -> None:
+        self._prepare_sync_repo()
+        config_path = self._write_config()
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8").replace("sync_enabled = true", "sync_enabled = false"),
+            encoding="utf-8",
+        )
+        subject = runner.Runner(runner.RunnerConfig.load(config_path))
+        result = subject.submit(self._sync_job(job_id="sync-disabled"))
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertEqual(result["error"]["code"], "sync_not_allowed")
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
         subject.close()
 
     def test_restart_recovers_validated_and_fails_stale_active_states(self) -> None:
@@ -487,6 +1402,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertTrue(payload["truncated"])
 
     def test_readonly_tool_schema_matches_runtime_numeric_bounds(self) -> None:
+        self.assertEqual(runner.DECISION_SCHEMA["properties"]["route"]["enum"], ["ornith", "codex"])
         definitions = {item["function"]["name"]: item["function"] for item in runner.READONLY_TOOL_DEFS}
         self.assertEqual(definitions["list_files"]["parameters"]["properties"]["limit"], {
             "type": "integer",

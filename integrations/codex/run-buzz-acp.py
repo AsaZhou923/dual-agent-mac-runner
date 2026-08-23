@@ -6,16 +6,19 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
+    import tomli as tomllib
 
 
 SETTINGS_PATH = Path(
     os.environ.get("BUZZ_ACP_SETTINGS_PATH", "~/.config/buzz-acp/settings.toml")
 ).expanduser()
 HEX_PUBKEY = re.compile(r"^[0-9a-f]{64}$")
-UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def fail(message: str) -> None:
@@ -67,6 +70,22 @@ def validate_auth_tag(raw: str, expected_owner: str) -> str:
     return json.dumps(tag, separators=(",", ":"))
 
 
+def setting_int(
+    settings: dict[str, object],
+    key: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int = 86_400,
+) -> int:
+    value = settings.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(f"{key} must be an integer")
+    if value < minimum or value > maximum:
+        fail(f"{key} must be between {minimum} and {maximum}")
+    return value
+
+
 def main() -> None:
     settings = tomllib.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     if settings.get("enabled") is not True:
@@ -89,17 +108,9 @@ def main() -> None:
     if not all(isinstance(item, str) and HEX_PUBKEY.fullmatch(item) for item in allowlist):
         fail("every allowlist entry must be a 64-character lowercase hex public key")
 
-    channels = settings.get("channel_ids", [])
-    if not isinstance(channels, list) or not channels:
-        fail("channel_ids must contain the production coordination channel")
-    if not all(isinstance(item, str) and UUID.fullmatch(item) for item in channels):
-        fail("every channel_id must be a lowercase UUID")
-
     event_kinds = settings.get("event_kinds", [])
-    if not isinstance(event_kinds, list) or not event_kinds:
-        fail("event_kinds must be explicit")
-    if not all(isinstance(item, int) and 0 <= item <= 65535 for item in event_kinds):
-        fail("every event kind must be an integer from 0 through 65535")
+    if event_kinds != [9]:
+        fail("event_kinds must be exactly [9] for the production mention-only intake")
 
     subscribe = str(settings.get("subscribe", ""))
     if subscribe != "mentions":
@@ -108,6 +119,27 @@ def main() -> None:
     system_prompt_file = Path(str(settings.get("system_prompt_file", ""))).expanduser()
     if not system_prompt_file.is_file():
         fail("system_prompt_file is missing")
+
+    agents = setting_int(settings, "agents", 1, minimum=1, maximum=1)
+    heartbeat_interval = setting_int(settings, "heartbeat_interval", 900)
+    idle_timeout_seconds = setting_int(settings, "idle_timeout_seconds", 900, minimum=1)
+    max_turn_duration_seconds = setting_int(
+        settings, "max_turn_duration_seconds", 7200, minimum=1
+    )
+    turn_liveness_seconds = setting_int(
+        settings, "turn_liveness_seconds", 10, minimum=1
+    )
+    idle_pool_sleep_seconds = setting_int(
+        settings, "idle_pool_sleep_seconds", 300, minimum=1
+    )
+    exit_after_inactivity_seconds = setting_int(
+        settings, "exit_after_inactivity_seconds", 0
+    )
+    permission_mode = str(settings.get("permission_mode", "default"))
+    if permission_mode != "default":
+        fail("permission_mode must remain default until Runner-only tool and network gates pass")
+    if settings.get("lazy_pool", True) is not True:
+        fail("lazy_pool must remain enabled")
 
     secret = read_keychain_secret(
         str(settings["keychain_account"]),
@@ -148,23 +180,32 @@ def main() -> None:
             "BUZZ_RELAY_URL": relay_url,
             "BUZZ_ACP_AGENT_COMMAND": str(settings.get("codex_acp_command", "codex-acp")),
             "BUZZ_ACP_AGENT_ARGS": "",
-            "BUZZ_ACP_AGENTS": str(int(settings.get("agents", 1))),
-            "BUZZ_ACP_HEARTBEAT_INTERVAL": str(int(settings.get("heartbeat_interval", 0))),
-            "BUZZ_ACP_IDLE_TIMEOUT": str(int(settings.get("idle_timeout_seconds", 620))),
-            "BUZZ_ACP_MAX_TURN_DURATION": str(int(settings.get("max_turn_duration_seconds", 7200))),
+            "BUZZ_ACP_AGENTS": str(agents),
+            "BUZZ_ACP_HEARTBEAT_INTERVAL": str(heartbeat_interval),
+            "BUZZ_ACP_HEARTBEAT_PROMPT": (
+                "Reconcile Mac Runner status and its SQLite ledger. Check for an "
+                "ownerless non-terminal job or a host/Ollama/Git threshold change. "
+                "If there is no anomaly, do not post to Buzz. Never create side effects "
+                "from a heartbeat."
+            ),
+            "BUZZ_ACP_IDLE_TIMEOUT": str(idle_timeout_seconds),
+            "BUZZ_ACP_MAX_TURN_DURATION": str(max_turn_duration_seconds),
             "BUZZ_ACP_RESPOND_TO": "allowlist",
             "BUZZ_ACP_RESPOND_TO_ALLOWLIST": ",".join(allowlist),
             "BUZZ_ACP_ALLOWED_RESPOND_TO": "owner-only,allowlist",
             "BUZZ_ACP_SUBSCRIBE": subscribe,
             "BUZZ_ACP_KINDS": ",".join(str(item) for item in event_kinds),
-            "BUZZ_ACP_CHANNELS": ",".join(channels),
             "BUZZ_ACP_SYSTEM_PROMPT_FILE": str(system_prompt_file),
             "BUZZ_ACP_DEDUP": "queue",
             "BUZZ_ACP_MULTIPLE_EVENT_HANDLING": "queue",
-            "BUZZ_ACP_TURN_LIVENESS_SECS": "10",
+            "BUZZ_ACP_TURN_LIVENESS_SECS": str(turn_liveness_seconds),
             "BUZZ_ACP_NO_MEMORY": "true",
             "BUZZ_ACP_SESSION_TITLE": "Mac Codex Supervisor",
             "BUZZ_ACP_RELAY_OBSERVER": "true" if relay_observer else "false",
+            "BUZZ_ACP_LAZY_POOL": "true",
+            "BUZZ_ACP_IDLE_POOL_SLEEP": str(idle_pool_sleep_seconds),
+            "BUZZ_ACP_EXIT_AFTER_INACTIVITY": str(exit_after_inactivity_seconds),
+            "BUZZ_ACP_PERMISSION_MODE": permission_mode,
         }
     )
     if auth_tag is not None:

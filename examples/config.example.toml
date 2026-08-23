@@ -10,6 +10,8 @@ result_schema_path = "/absolute/path/to/dual-agent-mac-runner/schemas/result_sch
 max_changed_files = 16
 max_diff_bytes = 65536
 active_lease_seconds = 120
+service_label = "com.example.dual-agent-mac-runner"
+owner_pubkey = ""
 
 [ollama]
 endpoint = "http://127.0.0.1:11434"
@@ -25,7 +27,54 @@ allow_write_tasks = false
 
 [capabilities]
 image_generation = false
+git = false
+sync-registered-repo = false
+push-task-branch = false
+manage-pr = false
+install-user-tool = false
+restart-user-service = false
 
-[repos.example]
-path = "/absolute/path/to/repository"
+[repos.project_a]
+path = "/absolute/path/to/repo"
 test_profiles = ["review-readonly"]
+sensitive_paths = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials/*", "secrets/*"]
+sync_enabled = false
+
+# Synchronization is disabled unless every fixed field is explicitly set.
+# [repos.example_sync]
+# path = "/absolute/path/to/existing/checkout"
+# test_profiles = ["review-readonly", "git-sync-verify"]
+# sensitive_paths = [".env", ".env.*", "*.pem", "*.key", "credentials/*", "secrets/*"]
+# sync_enabled = true
+# canonical_remote_url = "https://github.com/owner/repo.git"
+# sync_remote = "origin"
+# sync_branch = "main"
+
+# Privileged jobs are fail-closed unless runner.owner_pubkey is the real owner
+# pubkey and owner_approval exactly matches the deterministic action summary.
+#
+# Capability bindings are intentionally narrow: each capability must resolve to a
+# single fixed remote/tool/service on the Mac. Do not use these bindings to
+# emulate free shell access.
+#
+# `sensitive_paths` is fail-closed: any tracked match in `target_sha` rejects the
+# job before model/tool/test/worktree access, and any modified/new match is
+# rejected during write gating. Keep this list explicit per repo.
+#
+# [capability_bindings.push-task-branch]
+# remote = "origin"
+# allowed_branch_prefixes = ["job/"]
+# protected_branch_prefixes = ["main", "master", "release/", "prod/", "production/"]
+#
+# [capability_bindings.manage-pr]
+# remote = "origin"
+# allowed_branch_prefixes = ["job/"]
+# protected_branch_prefixes = ["main", "master", "release/", "prod/", "production/"]
+#
+# [capability_bindings.install-user-tool]
+# fixed_name = "example-cli"
+# fixed_source = "pipx"
+# fixed_version = "1.2.3"
+#
+# [capability_bindings.restart-user-service]
+# service_labels = ["com.example.buzz-acp"]

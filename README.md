@@ -15,13 +15,27 @@ ledger, `(job_id, attempt)` idempotency, disposable Git worktrees, path and
 profile policy, deadlines, verification, and structured results. Mac Codex is
 the required local supervisor; Ornith is a constrained read-only worker.
 
+The current contract accepts strict `mac-job/v1` policy v2 payloads while
+retaining a legacy adapter for `write`, `allowed_paths`, and `test_profile`.
+Policy v2 separates descriptive requirements from execution authorization with
+four permission profiles: `observe`, `standard-worktree`, `operational`, and
+`privileged`.
+
 ## Safety properties
 
 - Standard-library-only Python 3.14 implementation.
 - Exact 40-character Git SHAs and a configured repository allowlist.
+- Strict top-level policy-v2 schema and a 48 KiB canonical wire-payload budget.
+- Original wire payload/hash plus canonical policy fields retained in SQLite.
 - Approved test profiles executed without `shell=True`.
 - Temporary HOME plus a no-network Seatbelt profile for tests.
-- Write jobs are limited by `allowed_paths`, changed-file count, and diff size.
+- Worktree writes are limited by scope, changed-file count, diff size, and
+  configured sensitive-path patterns.
+- Operational actions use fixed capability handlers for registered-repository
+  sync, task-branch push, PR management, fixed user-tool installation, and
+  configured user-service restart.
+- Privileged actions require an exact, recent owner approval bound to one
+  deterministic action summary.
 - Credentials are removed from worker and test environments.
 - Runner state, task artifacts, worktrees, logs, and model files stay outside Git.
 
@@ -51,6 +65,12 @@ MAC_RUNNER_PYTHON=/path/to/python3 scripts/mac-runner --help
 
 Do not commit a real `config.toml`, SQLite database, task artifact, Buzz setting,
 Keychain value, Codex session, Ollama manifest, GGUF file, log, or worktree.
+
+The Buzz ACP launcher template is mention-only and dynamically subscribes to
+Relay channels where the Agent is a member. It enforces one Agent, Queue/Queue
+event handling, lazy child creation, a read-only heartbeat, relay observation,
+and `permission_mode=default`; it deliberately does not inject a static channel
+list or a generic MCP shell command.
 
 See `docs/operations.md` for the safe cutover sequence and
 `docs/dependencies.md` for the audited dependency baseline.

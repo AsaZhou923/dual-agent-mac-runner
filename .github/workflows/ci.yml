@@ -31,6 +31,7 @@ jobs:
           for path in (
               Path("runner.py"),
               Path("tests/test_runner.py"),
+              Path("tests/test_buzz_launcher.py"),
               Path("integrations/codex/run-buzz-acp.py"),
           ):
               ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -38,6 +39,7 @@ jobs:
           for path in (
               Path("examples/config.example.toml"),
               Path("examples/profiles/backend-unit.toml"),
+              Path("profiles/git-sync-verify.toml"),
               Path("profiles/review-readonly.toml"),
               Path("integrations/codex/settings.example.toml"),
           ):

@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import datetime as dt
 import errno
 import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -17,11 +19,16 @@ import sys
 import tempfile
 import textwrap
 import time
-import tomllib
 import urllib.error
 import urllib.request
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Iterator
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
+    import tomli as tomllib
 
 
 TERMINAL_STATES = {"DONE", "FAILED", "REJECTED", "CANCELLED"}
@@ -46,6 +53,23 @@ SECRET_ENV_KEYS = {
     "GOOGLE_API_KEY",
     "GITHUB_TOKEN",
 }
+GIT_BIN = "/usr/bin/git"
+SYNC_TEST_PROFILE = "git-sync-verify"
+JOB_SCHEMA_VERSION = "mac-job/v1"
+POLICY_V2 = 2
+WIRE_PAYLOAD_MAX_BYTES = 48 * 1024
+PERMISSION_PROFILES = {"observe", "standard-worktree", "operational", "privileged"}
+SCOPE_ROOTS = {"metadata-only", "worktree", "registered-checkout"}
+NETWORK_MODES = {"none", "relay-only", "declared-remotes-and-registries"}
+OPERATIONAL_CAPABILITIES = {
+    "sync-registered-repo",
+    "push-task-branch",
+    "manage-pr",
+    "install-user-tool",
+    "restart-user-service",
+}
+DEFAULT_ALLOWED_SERVICE_LABELS: tuple[str, ...] = ()
+DEFAULT_PROTECTED_BRANCH_PREFIXES = ("main", "master", "release/", "prod/", "production/")
 READONLY_TOOL_DEFS = [
     {
         "type": "function",
@@ -175,6 +199,10 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def canonical_json_bytes(data: Any) -> bytes:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -221,6 +249,17 @@ def parse_json_object_text(value: str) -> dict[str, Any]:
         raise RunnerError("invalid_json", "Model response must contain one JSON object") from exc
     if not isinstance(parsed, dict):
         raise RunnerError("invalid_json", "Model response must be a JSON object")
+    return parsed
+
+
+def parse_iso8601(value: str) -> dt.datetime:
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise RunnerError("invalid_owner_approval", "owner_approval.approved_at must be ISO-8601 with timezone") from exc
+    if parsed.tzinfo is None:
+        raise RunnerError("invalid_owner_approval", "owner_approval.approved_at must include timezone")
     return parsed
 
 
@@ -372,6 +411,24 @@ class RepoConfig:
     path: Path
     fetch_remote: str | None
     test_profiles: tuple[str, ...]
+    sync_enabled: bool
+    canonical_remote_url: str | None
+    sync_remote: str | None
+    sync_branch: str | None
+    tool_registry: tuple[str, ...] = ()
+    sensitive_paths: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class CapabilityConfig:
+    enabled: bool
+    fixed_name: str | None = None
+    fixed_source: str | None = None
+    fixed_version: str | None = None
+    service_labels: tuple[str, ...] = ()
+    remote: str | None = None
+    allowed_branch_prefixes: tuple[str, ...] = ()
+    protected_branch_prefixes: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,6 +437,14 @@ class TestProfile:
     command: list[str]
     timeout_seconds: int
     description: str
+
+
+@dataclasses.dataclass(frozen=True)
+class VerificationRun:
+    profile: str
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
 
 
 @dataclasses.dataclass
@@ -396,6 +461,8 @@ class RunnerConfig:
     max_changed_files: int
     max_diff_bytes: int
     active_lease_seconds: int
+    service_label: str | None
+    owner_pubkey: str | None
     ollama_endpoint: str
     ollama_model: str
     ollama_timeout_seconds: int
@@ -406,6 +473,7 @@ class RunnerConfig:
     supervisor_allow_write_tasks: bool
     capabilities: dict[str, bool]
     repos: dict[str, RepoConfig]
+    capability_config: dict[str, CapabilityConfig]
 
     @classmethod
     def load(cls, config_path: Path) -> "RunnerConfig":
@@ -415,21 +483,96 @@ class RunnerConfig:
         ollama_cfg = data["ollama"]
         supervisor_cfg = data["supervisor"]
         raw_capabilities = data.get("capabilities", {})
+        raw_capability_config = data.get("capability_bindings", {})
         if not isinstance(raw_capabilities, dict) or not all(
             isinstance(name, str) and name and isinstance(enabled, bool)
             for name, enabled in raw_capabilities.items()
         ):
             raise RunnerError("invalid_config", "capabilities must be a TOML table of boolean flags")
-        repos = {
-            repo_id: RepoConfig(
+        if raw_capability_config and not isinstance(raw_capability_config, dict):
+            raise RunnerError("invalid_config", "capability_bindings must be a TOML table")
+        repos: dict[str, RepoConfig] = {}
+        for repo_id, entry in data.get("repos", {}).items():
+            sync_enabled = entry.get("sync_enabled", False)
+            if not isinstance(sync_enabled, bool):
+                raise RunnerError("invalid_config", f"repos.{repo_id}.sync_enabled must be boolean")
+            canonical_remote_url = entry.get("canonical_remote_url")
+            sync_remote = entry.get("sync_remote")
+            sync_branch = entry.get("sync_branch")
+            if sync_enabled:
+                required_sync_values = {
+                    "canonical_remote_url": canonical_remote_url,
+                    "sync_remote": sync_remote,
+                    "sync_branch": sync_branch,
+                }
+                missing = sorted(name for name, value in required_sync_values.items() if not isinstance(value, str) or not value)
+                if missing:
+                    raise RunnerError(
+                        "invalid_config",
+                        f"repos.{repo_id} is sync-enabled but missing: {', '.join(missing)}",
+                    )
+                for label, value in (("sync_remote", sync_remote), ("sync_branch", sync_branch)):
+                    assert isinstance(value, str)
+                    if value.startswith("-") or ".." in value or not re.fullmatch(r"[A-Za-z0-9._/-]+", value):
+                        raise RunnerError("invalid_config", f"repos.{repo_id}.{label} is not a safe fixed Git name")
+            repos[repo_id] = RepoConfig(
                 repo_id=repo_id,
                 path=Path(entry["path"]).expanduser().resolve(),
                 fetch_remote=entry.get("fetch_remote"),
                 test_profiles=tuple(entry.get("test_profiles", [])),
+                sync_enabled=sync_enabled,
+                canonical_remote_url=canonical_remote_url if isinstance(canonical_remote_url, str) else None,
+                sync_remote=sync_remote if isinstance(sync_remote, str) else None,
+                sync_branch=sync_branch if isinstance(sync_branch, str) else None,
+                tool_registry=tuple(str(item) for item in entry.get("tool_registry", [])),
+                sensitive_paths=tuple(cls._validate_sensitive_patterns(repo_id, entry.get("sensitive_paths", []))),
             )
-            for repo_id, entry in data.get("repos", {}).items()
-        }
+        capability_config: dict[str, CapabilityConfig] = {}
+        for name in OPERATIONAL_CAPABILITIES:
+            binding = raw_capability_config.get(name, {}) if isinstance(raw_capability_config, dict) else {}
+            if binding and not isinstance(binding, dict):
+                raise RunnerError("invalid_config", f"capability_bindings.{name} must be a TOML table")
+            if name == "restart-user-service":
+                raw_service_labels = binding.get("service_labels", DEFAULT_ALLOWED_SERVICE_LABELS)
+                if not isinstance(raw_service_labels, (list, tuple)) or not all(
+                    isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9.-]{1,255}", item)
+                    for item in raw_service_labels
+                ):
+                    raise RunnerError(
+                        "invalid_config",
+                        "capability_bindings.restart-user-service.service_labels must contain safe LaunchAgent labels",
+                    )
+                service_labels = tuple(raw_service_labels)
+                capability_config[name] = CapabilityConfig(
+                    enabled=bool(raw_capabilities.get(name, False)),
+                    service_labels=service_labels,
+                )
+            elif name == "install-user-tool":
+                capability_config[name] = CapabilityConfig(
+                    enabled=bool(raw_capabilities.get(name, False)),
+                    fixed_name=str(binding.get("fixed_name", "")).strip() or None,
+                    fixed_source=str(binding.get("fixed_source", "")).strip() or None,
+                    fixed_version=str(binding.get("fixed_version", "")).strip() or None,
+                )
+            elif name in {"push-task-branch", "manage-pr"}:
+                prefixes = tuple(str(item) for item in binding.get("allowed_branch_prefixes", ["job/"]))
+                protected = tuple(str(item) for item in binding.get("protected_branch_prefixes", DEFAULT_PROTECTED_BRANCH_PREFIXES))
+                capability_config[name] = CapabilityConfig(
+                    enabled=bool(raw_capabilities.get(name, False)),
+                    remote=str(binding.get("remote", "")).strip() or None,
+                    allowed_branch_prefixes=prefixes,
+                    protected_branch_prefixes=protected,
+                )
+            else:
+                capability_config[name] = CapabilityConfig(enabled=bool(raw_capabilities.get(name, False)))
         raw_model = str(supervisor_cfg.get("model", "")).strip()
+        service_label = str(runner_cfg.get("service_label", "")).strip() or None
+        if service_label is not None and not re.fullmatch(r"[A-Za-z0-9.-]{1,255}", service_label):
+            raise RunnerError("invalid_config", "runner.service_label must be a safe LaunchAgent label")
+        owner_pubkey = str(runner_cfg.get("owner_pubkey", "")).strip().lower() or None
+        if owner_pubkey is not None:
+            if owner_pubkey == "0" * 64 or not re.fullmatch(r"[0-9a-f]{64}", owner_pubkey):
+                raise RunnerError("invalid_config", "runner.owner_pubkey must be a real 64-hex owner pubkey")
         return cls(
             app_dir=app_dir,
             state_dir=Path(runner_cfg["state_dir"]).expanduser(),
@@ -443,6 +586,8 @@ class RunnerConfig:
             max_changed_files=int(runner_cfg["max_changed_files"]),
             max_diff_bytes=int(runner_cfg["max_diff_bytes"]),
             active_lease_seconds=int(runner_cfg["active_lease_seconds"]),
+            service_label=service_label,
+            owner_pubkey=owner_pubkey,
             ollama_endpoint=str(ollama_cfg["endpoint"]).rstrip("/"),
             ollama_model=str(ollama_cfg["model"]),
             ollama_timeout_seconds=int(ollama_cfg["timeout_seconds"]),
@@ -453,7 +598,22 @@ class RunnerConfig:
             supervisor_allow_write_tasks=bool(supervisor_cfg["allow_write_tasks"]),
             capabilities=dict(sorted(raw_capabilities.items())),
             repos=repos,
+            capability_config=capability_config,
         )
+
+    @staticmethod
+    def _validate_sensitive_patterns(repo_id: str, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            raise RunnerError("invalid_config", f"repos.{repo_id}.sensitive_paths must be an array")
+        patterns: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise RunnerError("invalid_config", f"repos.{repo_id}.sensitive_paths must contain non-empty strings")
+            pattern = item.strip()
+            if pattern.startswith("/") or pattern.startswith("~") or ".." in pattern.split("/"):
+                raise RunnerError("invalid_config", f"repos.{repo_id}.sensitive_paths may not use absolute or parent-relative patterns")
+            patterns.append(pattern)
+        return patterns
 
 
 class Ledger:
@@ -471,6 +631,15 @@ class Ledger:
               job_id TEXT NOT NULL,
               attempt INTEGER NOT NULL,
               payload_json TEXT NOT NULL,
+              wire_payload_json TEXT,
+              wire_payload_hash TEXT,
+              policy_version INTEGER,
+              permission_profile TEXT,
+              capabilities_json TEXT,
+              scope_json TEXT,
+              network_mode TEXT,
+              verification_profiles_json TEXT,
+              owner_approval_json TEXT,
               status TEXT NOT NULL,
               route TEXT,
               repo_id TEXT NOT NULL,
@@ -499,7 +668,73 @@ class Ledger:
             )
             """
         )
+        self._ensure_column("jobs", "wire_payload_json", "TEXT")
+        self._ensure_column("jobs", "wire_payload_hash", "TEXT")
+        self._ensure_column("jobs", "policy_version", "INTEGER")
+        self._ensure_column("jobs", "permission_profile", "TEXT")
+        self._ensure_column("jobs", "capabilities_json", "TEXT")
+        self._ensure_column("jobs", "scope_json", "TEXT")
+        self._ensure_column("jobs", "network_mode", "TEXT")
+        self._ensure_column("jobs", "verification_profiles_json", "TEXT")
+        self._ensure_column("jobs", "owner_approval_json", "TEXT")
+        self._backfill_legacy_jobs()
         self.conn.commit()
+
+    def _ensure_column(self, table: str, name: str, declared_type: str) -> None:
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if name not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declared_type}")
+
+    def _backfill_legacy_jobs(self) -> None:
+        rows = self.conn.execute(
+            """
+            SELECT job_id, attempt, payload_json, wire_payload_json, policy_version
+            FROM jobs
+            WHERE wire_payload_json IS NULL OR wire_payload_hash IS NULL OR policy_version IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            wire_payload = payload
+            if not isinstance(payload, dict):
+                raise RunnerError("ledger_error", f"Job {row['job_id']}/{row['attempt']} payload_json is not an object")
+            canonical, wire_meta = normalize_job_payload(wire_payload)
+            self.conn.execute(
+                """
+                UPDATE jobs
+                SET payload_json = ?,
+                    wire_payload_json = ?,
+                    wire_payload_hash = ?,
+                    policy_version = ?,
+                    permission_profile = ?,
+                    capabilities_json = ?,
+                    scope_json = ?,
+                    network_mode = ?,
+                    verification_profiles_json = ?,
+                    owner_approval_json = ?,
+                    write_enabled = ?,
+                    repo_id = ?,
+                    deadline_seconds = ?
+                WHERE job_id = ? AND attempt = ?
+                """,
+                (
+                    json_dumps(canonical),
+                    json_dumps(wire_meta["wire_payload"]),
+                    wire_meta["wire_payload_hash"],
+                    canonical.get("policy_version"),
+                    canonical.get("permission_profile"),
+                    json_dumps(canonical.get("capabilities", [])),
+                    json_dumps(canonical.get("scope", {})),
+                    canonical.get("network", {}).get("mode") if isinstance(canonical.get("network"), dict) else None,
+                    json_dumps(canonical.get("verification_profiles", [])),
+                    json_dumps(canonical.get("owner_approval")) if canonical.get("owner_approval") is not None else None,
+                    1 if canonical.get("write") else 0,
+                    canonical["repo_id"],
+                    canonical["deadline_seconds"],
+                    row["job_id"],
+                    int(row["attempt"]),
+                ),
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -509,23 +744,35 @@ class Ledger:
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json_dumps(record) + "\n")
 
-    def insert_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def insert_job(self, payload: dict[str, Any], *, wire_payload: dict[str, Any], wire_payload_hash: str) -> dict[str, Any]:
         now = utc_now()
         canonical_payload = json_dumps(payload)
+        wire_payload_json = json_dumps(wire_payload)
         changed_before = self.conn.total_changes
         with self.conn:
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO jobs (
-                  job_id, attempt, payload_json, status, repo_id, write_enabled,
+                  job_id, attempt, payload_json, wire_payload_json, wire_payload_hash,
+                  policy_version, permission_profile, capabilities_json, scope_json, network_mode,
+                  verification_profiles_json, owner_approval_json, status, repo_id, write_enabled,
                   deadline_seconds, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["job_id"],
                     payload["attempt"],
                     canonical_payload,
+                    wire_payload_json,
+                    wire_payload_hash,
+                    payload.get("policy_version"),
+                    payload.get("permission_profile"),
+                    json_dumps(payload.get("capabilities", [])),
+                    json_dumps(payload.get("scope", {})),
+                    payload.get("network", {}).get("mode") if isinstance(payload.get("network"), dict) else None,
+                    json_dumps(payload.get("verification_profiles", [])),
+                    json_dumps(payload.get("owner_approval")) if payload.get("owner_approval") is not None else None,
                     "RECEIVED",
                     payload["repo_id"],
                     1 if payload["write"] else 0,
@@ -536,7 +783,7 @@ class Ledger:
             )
             inserted = self.conn.total_changes > changed_before
             row = self.conn.execute(
-                "SELECT payload_json FROM jobs WHERE job_id = ? AND attempt = ?",
+                "SELECT payload_json, wire_payload_json FROM jobs WHERE job_id = ? AND attempt = ?",
                 (payload["job_id"], payload["attempt"]),
             ).fetchone()
             if row is None:
@@ -545,6 +792,11 @@ class Ledger:
                 raise RunnerError(
                     "idempotency_conflict",
                     f"Job {payload['job_id']}/{payload['attempt']} already exists with different payload",
+                )
+            if row["wire_payload_json"] and row["wire_payload_json"] != wire_payload_json:
+                raise RunnerError(
+                    "idempotency_conflict",
+                    f"Job {payload['job_id']}/{payload['attempt']} already exists with different wire payload",
                 )
             if inserted:
                 self.conn.execute(
@@ -563,6 +815,7 @@ class Ledger:
             return None
         result = dict(row)
         result["payload"] = json.loads(result.pop("payload_json"))
+        result["wire_payload"] = json.loads(result["wire_payload_json"]) if result.get("wire_payload_json") else result["payload"]
         result["result"] = json.loads(result["result_json"]) if result.get("result_json") else None
         result["error"] = json.loads(result["error_json"]) if result.get("error_json") else None
         result.pop("result_json", None)
@@ -678,8 +931,16 @@ class Ledger:
 
 
 class FileLock:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        busy_code: str = "runner_busy",
+        busy_message: str = "Another runner process currently holds the task lock.",
+    ) -> None:
         self.path = path
+        self.busy_code = busy_code
+        self.busy_message = busy_message
         self.handle: Any = None
 
     def __enter__(self) -> "FileLock":
@@ -690,7 +951,7 @@ class FileLock:
         except OSError as exc:
             self.handle.close()
             if exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise RunnerError("runner_busy", "Another runner process currently holds the task lock.")
+                raise RunnerError(self.busy_code, self.busy_message)
             raise
         return self
 
@@ -721,6 +982,111 @@ class ProfileStore:
         )
 
 
+def _string_list(value: Any, *, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise RunnerError("schema_validation_failed", f"{field} must be an array of non-empty strings")
+    return list(value)
+
+
+def normalize_job_payload(raw_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    wire_payload = json.loads(json.dumps(raw_payload))
+    wire_bytes = canonical_json_bytes(wire_payload)
+    if len(wire_bytes) > WIRE_PAYLOAD_MAX_BYTES:
+        raise RunnerError("payload_too_large", f"Wire payload exceeds {WIRE_PAYLOAD_MAX_BYTES} bytes")
+
+    common: dict[str, Any] = {
+        "schema": wire_payload.get("schema"),
+        "job_id": wire_payload.get("job_id"),
+        "attempt": wire_payload.get("attempt"),
+        "repo_id": wire_payload.get("repo_id"),
+        "base_sha": wire_payload.get("base_sha"),
+        "target_sha": wire_payload.get("target_sha"),
+        "task_type": wire_payload.get("task_type"),
+        "focus": list(wire_payload.get("focus", [])),
+        "deadline_seconds": wire_payload.get("deadline_seconds"),
+        "supervisor": wire_payload.get("supervisor"),
+        "execution_route": wire_payload.get("execution_route"),
+        "preferred_worker": wire_payload.get("preferred_worker"),
+        "required_capabilities": list(wire_payload.get("required_capabilities", [])),
+        "summary": wire_payload.get("summary"),
+        "instructions": wire_payload.get("instructions"),
+        "acceptance_criteria": list(wire_payload.get("acceptance_criteria", [])) if "acceptance_criteria" in wire_payload else [],
+        "metadata": dict(wire_payload.get("metadata", {})) if isinstance(wire_payload.get("metadata"), dict) else {},
+        "context": dict(wire_payload.get("context", {})) if isinstance(wire_payload.get("context"), dict) else {},
+        "extensions": dict(wire_payload.get("extensions", {})) if isinstance(wire_payload.get("extensions"), dict) else {},
+    }
+    if common["schema"] != JOB_SCHEMA_VERSION:
+        raise RunnerError("schema_validation_failed", f"$.schema must be {JOB_SCHEMA_VERSION}")
+
+    has_policy_v2 = wire_payload.get("policy_version") == POLICY_V2 or "permission_profile" in wire_payload
+    if has_policy_v2:
+        permission_profile = wire_payload.get("permission_profile")
+        if permission_profile not in PERMISSION_PROFILES:
+            raise RunnerError("schema_validation_failed", "$.permission_profile must be a known permission profile")
+        scope = wire_payload.get("scope")
+        network = wire_payload.get("network")
+        if not isinstance(scope, dict) or scope.get("root") not in SCOPE_ROOTS:
+            raise RunnerError("schema_validation_failed", "$.scope.root must be a known scope root")
+        if not isinstance(network, dict) or network.get("mode") not in NETWORK_MODES:
+            raise RunnerError("schema_validation_failed", "$.network.mode must be a known network mode")
+        capabilities = _string_list(wire_payload.get("capabilities", []), field="$.capabilities")
+        verification_profiles = _string_list(wire_payload.get("verification_profiles", []), field="$.verification_profiles")
+        owner_approval = wire_payload.get("owner_approval")
+        if permission_profile == "privileged":
+            if not isinstance(owner_approval, dict):
+                raise RunnerError("missing_owner_approval", "privileged jobs require owner_approval")
+            approved_by = owner_approval.get("approved_by")
+            approval_ref = owner_approval.get("approval_ref")
+            approved_at = owner_approval.get("approved_at")
+            summary = owner_approval.get("summary")
+            if not isinstance(approved_by, str) or not re.fullmatch(r"[0-9a-f]{64}", approved_by):
+                raise RunnerError("invalid_owner_approval", "owner_approval.approved_by must be a 64-hex pubkey")
+            if not isinstance(approval_ref, str) or not approval_ref:
+                raise RunnerError("invalid_owner_approval", "owner_approval.approval_ref must be a non-empty string")
+            if not isinstance(summary, str) or not summary:
+                raise RunnerError("invalid_owner_approval", "owner_approval.summary must be a non-empty string")
+            parse_iso8601(str(approved_at))
+        canonical = {
+            **common,
+            "policy_version": POLICY_V2,
+            "permission_profile": permission_profile,
+            "capabilities": capabilities,
+            "scope": {
+                "root": scope["root"],
+                "paths": _string_list(scope.get("paths", []), field="$.scope.paths") if "paths" in scope else [],
+            },
+            "network": {"mode": network["mode"]},
+            "verification_profiles": verification_profiles,
+            "owner_approval": owner_approval if isinstance(owner_approval, dict) else None,
+            "write": permission_profile == "standard-worktree",
+            "allowed_paths": list(scope.get("paths", [])) if isinstance(scope, dict) else [],
+            "test_profile": verification_profiles[0] if verification_profiles else None,
+        }
+        return canonical, {"wire_payload": wire_payload, "wire_payload_hash": sha256_hex(wire_bytes)}
+
+    write_enabled = wire_payload.get("write")
+    if not isinstance(write_enabled, bool):
+        raise RunnerError("schema_validation_failed", "$.write is required for legacy policy")
+    allowed_paths = _string_list(wire_payload.get("allowed_paths", []), field="$.allowed_paths")
+    test_profile = wire_payload.get("test_profile")
+    if not isinstance(test_profile, str) or not test_profile:
+        raise RunnerError("schema_validation_failed", "$.test_profile is required for legacy policy")
+    canonical = {
+        **common,
+        "policy_version": 1,
+        "permission_profile": "standard-worktree" if write_enabled else "observe",
+        "capabilities": [],
+        "scope": {"root": "worktree", "paths": allowed_paths},
+        "network": {"mode": "none"},
+        "verification_profiles": [test_profile],
+        "owner_approval": None,
+        "write": write_enabled,
+        "allowed_paths": allowed_paths,
+        "test_profile": test_profile,
+    }
+    return canonical, {"wire_payload": wire_payload, "wire_payload_hash": sha256_hex(wire_bytes)}
+
+
 class WorktreeManager:
     def __init__(self, config: RunnerConfig) -> None:
         self.config = config
@@ -740,12 +1106,53 @@ class WorktreeManager:
         return candidate
 
     def allowed_roots(self, worktree: Path, allowed_paths: list[str]) -> list[Path]:
+        if not allowed_paths:
+            return [worktree.resolve()]
         return [self.resolve_relative_path(worktree, raw) for raw in allowed_paths]
 
-    def assert_exact_commit(self, repo: RepoConfig, sha: str, deadline: Deadline | None = None) -> None:
+    def is_sensitive_path(self, repo: RepoConfig, rel_path: str) -> bool:
+        normalized = rel_path.strip("/")
+        if not normalized:
+            return False
+        return any(fnmatch(normalized, pattern) for pattern in repo.sensitive_paths)
+
+    def assert_no_sensitive_paths(
+        self,
+        repo: RepoConfig,
+        sha: str,
+        deadline: Deadline | None = None,
+        *,
+        network_mode: str = "none",
+    ) -> None:
+        if not repo.sensitive_paths:
+            return
+        self.assert_exact_commit(repo, sha, deadline, network_mode=network_mode)
         env = safe_subprocess_env()
         timeout = deadline.remaining(30) if deadline else 30
-        if repo.fetch_remote:
+        output = run_command(
+            ["git", "-C", str(repo.path), "ls-tree", "-r", "--name-only", sha],
+            env=env,
+            timeout=timeout,
+        ).stdout
+        matches = [path for path in output.splitlines() if self.is_sensitive_path(repo, path)]
+        if matches:
+            raise RunnerError(
+                "sensitive_path_present",
+                f"Sensitive tracked paths are present in target commit {sha}",
+                details={"paths": matches[:32]},
+            )
+
+    def assert_exact_commit(
+        self,
+        repo: RepoConfig,
+        sha: str,
+        deadline: Deadline | None = None,
+        *,
+        network_mode: str = "none",
+    ) -> None:
+        env = safe_subprocess_env()
+        timeout = deadline.remaining(30) if deadline else 30
+        if network_mode == "declared-remotes-and-registries" and repo.fetch_remote:
             run_command(
                 ["git", "-C", str(repo.path), "fetch", "--quiet", repo.fetch_remote, sha],
                 check=True,
@@ -763,8 +1170,9 @@ class WorktreeManager:
     def prepare(self, job: dict[str, Any], deadline: Deadline) -> Path:
         payload = job["payload"]
         repo = self.repo(payload["repo_id"])
-        self.assert_exact_commit(repo, payload["base_sha"], deadline)
-        self.assert_exact_commit(repo, payload["target_sha"], deadline)
+        network_mode = payload.get("network", {}).get("mode", "none")
+        self.assert_exact_commit(repo, payload["base_sha"], deadline, network_mode=network_mode)
+        self.assert_exact_commit(repo, payload["target_sha"], deadline, network_mode=network_mode)
         worktree = (self.config.worktree_root / payload["job_id"] / str(payload["attempt"])).resolve()
         if self.config.worktree_root.resolve() not in worktree.parents:
             raise RunnerError("worktree_escape", "Resolved worktree escaped the configured root")
@@ -813,7 +1221,7 @@ class WorktreeManager:
         if status:
             raise RunnerError("readonly_dirty_worktree", "Readonly job left tracked or untracked modifications", details={"status": status})
 
-    def write_gate(self, worktree: Path, allowed_paths: list[str]) -> tuple[int, int, str]:
+    def write_gate(self, repo: RepoConfig, worktree: Path, allowed_paths: list[str]) -> tuple[int, int, str]:
         roots = self.allowed_roots(worktree, allowed_paths)
         env = safe_subprocess_env()
         status = self.status_lines(worktree)
@@ -824,6 +1232,8 @@ class WorktreeManager:
         for path in changed_files:
             if not any(root == path or root in path.parents for root in roots):
                 raise RunnerError("path_escape", f"Modified path escaped allowlist: {path.relative_to(worktree)}")
+            if self.is_sensitive_path(repo, str(path.relative_to(worktree))):
+                raise RunnerError("sensitive_path_present", f"Modified path matches sensitive allowlist: {path.relative_to(worktree)}")
         if changed_files:
             run_command(["git", "-C", str(worktree), "add", "-N", "--all"], env=env, timeout=30)
         diff = run_command(
@@ -857,6 +1267,215 @@ class WorktreeManager:
             env=env,
             timeout=deadline.remaining(10),
         ).stdout.strip()
+
+
+class GitSyncManager:
+    def __init__(self, config: RunnerConfig) -> None:
+        self.config = config
+
+    def lock_path(self, repo: RepoConfig) -> Path:
+        return self.config.state_dir / "repo-locks" / f"{repo.repo_id}.sync.lock"
+
+    def lock(self, repo: RepoConfig) -> FileLock:
+        return FileLock(
+            self.lock_path(repo),
+            busy_code="repo_sync_busy",
+            busy_message=f"Repository {repo.repo_id} is already being synchronized.",
+        )
+
+    def assert_configured(self, repo: RepoConfig) -> None:
+        if not repo.sync_enabled:
+            raise RunnerError("sync_not_allowed", f"Repository {repo.repo_id} is not enabled for synchronization")
+        if not repo.canonical_remote_url or not repo.sync_remote or not repo.sync_branch:
+            raise RunnerError("sync_config_incomplete", f"Repository {repo.repo_id} has incomplete synchronization config")
+
+    def preflight(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        self.assert_configured(repo)
+        snapshot = self._verify_checkout(repo, payload, deadline, allowed_heads={payload["base_sha"]})
+        self._fetch(repo, deadline)
+        remote_head = self._remote_head(repo, deadline)
+        if remote_head != payload["target_sha"]:
+            raise RunnerError(
+                "target_mismatch",
+                "Configured remote branch does not match the requested immutable target SHA",
+                details={"expected": payload["target_sha"], "actual": remote_head},
+            )
+        self._assert_ancestor(repo, payload["base_sha"], payload["target_sha"], deadline)
+        return {**snapshot, "remote_head": remote_head}
+
+    def apply_and_verify(
+        self,
+        repo: RepoConfig,
+        payload: dict[str, Any],
+        deadline: Deadline,
+        *,
+        prepared: bool,
+    ) -> dict[str, Any]:
+        self.assert_configured(repo)
+        if not prepared:
+            self._verify_checkout(
+                repo,
+                payload,
+                deadline,
+                allowed_heads={payload["base_sha"], payload["target_sha"]},
+            )
+            self._fetch(repo, deadline)
+        remote_head = self._remote_head(repo, deadline)
+        if remote_head != payload["target_sha"]:
+            raise RunnerError(
+                "target_mismatch",
+                "Configured remote branch does not match the requested immutable target SHA",
+                details={"expected": payload["target_sha"], "actual": remote_head},
+            )
+        snapshot = self._verify_checkout(
+            repo,
+            payload,
+            deadline,
+            allowed_heads={payload["base_sha"], payload["target_sha"]},
+        )
+        before_sha = snapshot["head"]
+        if before_sha == payload["base_sha"]:
+            self._assert_ancestor(repo, before_sha, payload["target_sha"], deadline)
+            merge = self._git(
+                repo,
+                [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "merge",
+                    "--ff-only",
+                    "--no-edit",
+                    "--",
+                    payload["target_sha"],
+                ],
+                deadline,
+                check=False,
+            )
+            if merge.returncode != 0:
+                raise RunnerError(
+                    "fast_forward_failed",
+                    "Git refused the fixed fast-forward-only update",
+                    details={"returncode": merge.returncode},
+                )
+        final = self._verify_checkout(repo, payload, deadline, allowed_heads={payload["target_sha"]})
+        final_remote_head = self._remote_head(repo, deadline)
+        if final_remote_head != payload["target_sha"]:
+            raise RunnerError("sync_postcondition_failed", "Remote-tracking ref changed during final verification")
+        return {
+            "repo_id": repo.repo_id,
+            "branch": repo.sync_branch,
+            "remote": repo.sync_remote,
+            "before_sha": before_sha,
+            "after_sha": final["head"],
+            "target_sha": payload["target_sha"],
+            "status": [],
+            "fast_forwarded": before_sha != final["head"],
+        }
+
+    def _verify_checkout(
+        self,
+        repo: RepoConfig,
+        payload: dict[str, Any],
+        deadline: Deadline,
+        *,
+        allowed_heads: set[str],
+    ) -> dict[str, Any]:
+        if not repo.path.is_dir():
+            raise RunnerError("not_git_checkout", f"Configured checkout for {repo.repo_id} does not exist")
+        inside = self._git(repo, ["rev-parse", "--is-inside-work-tree"], deadline, check=False)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            raise RunnerError("not_git_checkout", f"Configured path for {repo.repo_id} is not a Git worktree")
+        top = self._git(repo, ["rev-parse", "--show-toplevel"], deadline).stdout.strip()
+        try:
+            top_path = Path(top).resolve()
+        except OSError as exc:
+            raise RunnerError("not_git_checkout", f"Configured path for {repo.repo_id} has an invalid top level") from exc
+        if top_path != repo.path:
+            raise RunnerError("wrong_checkout", f"Configured path for {repo.repo_id} is not the worktree top level")
+        remote_urls = self._git(repo, ["remote", "get-url", "--all", repo.sync_remote or ""], deadline, check=False)
+        urls = [line for line in remote_urls.stdout.splitlines() if line]
+        if remote_urls.returncode != 0 or urls != [repo.canonical_remote_url]:
+            raise RunnerError("wrong_remote", f"Configured remote for {repo.repo_id} does not match its canonical allowlist URL")
+        branch = self._git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], deadline, check=False)
+        if branch.returncode != 0 or branch.stdout.strip() != repo.sync_branch:
+            raise RunnerError(
+                "wrong_branch",
+                f"Repository {repo.repo_id} is not on its configured synchronization branch",
+                details={"expected": repo.sync_branch},
+            )
+        status = self._git(repo, ["status", "--porcelain=v1", "--untracked-files=all"], deadline)
+        if status.stdout.splitlines():
+            raise RunnerError(
+                "dirty_worktree",
+                f"Repository {repo.repo_id} has tracked or untracked changes",
+                details={"entry_count": len(status.stdout.splitlines())},
+            )
+        head = self._rev_parse(repo, "HEAD", deadline)
+        if head not in allowed_heads:
+            raise RunnerError(
+                "base_mismatch",
+                f"Repository {repo.repo_id} HEAD is not the expected immutable base",
+                details={"expected": payload["base_sha"], "actual": head},
+            )
+        return {"head": head, "branch": branch.stdout.strip(), "status": []}
+
+    def _fetch(self, repo: RepoConfig, deadline: Deadline) -> None:
+        assert repo.sync_remote and repo.sync_branch
+        refspec = f"refs/heads/{repo.sync_branch}:refs/remotes/{repo.sync_remote}/{repo.sync_branch}"
+        result = self._git(
+            repo,
+            ["fetch", "--no-tags", "--no-prune", repo.sync_remote, refspec],
+            deadline,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RunnerError(
+                "fetch_failed",
+                f"Fetch from the configured remote for {repo.repo_id} failed",
+                details={"returncode": result.returncode},
+            )
+
+    def _remote_head(self, repo: RepoConfig, deadline: Deadline) -> str:
+        assert repo.sync_remote and repo.sync_branch
+        return self._rev_parse(repo, f"refs/remotes/{repo.sync_remote}/{repo.sync_branch}", deadline)
+
+    def _assert_ancestor(self, repo: RepoConfig, base_sha: str, target_sha: str, deadline: Deadline) -> None:
+        result = self._git(repo, ["merge-base", "--is-ancestor", base_sha, target_sha], deadline, check=False)
+        if result.returncode == 1:
+            raise RunnerError(
+                "non_fast_forward",
+                "Current HEAD is not an ancestor of the requested target SHA",
+                details={"base_sha": base_sha, "target_sha": target_sha},
+            )
+        if result.returncode != 0:
+            raise RunnerError(
+                "git_verification_failed",
+                "Git could not verify the configured fast-forward relationship",
+                details={"returncode": result.returncode},
+            )
+
+    def _rev_parse(self, repo: RepoConfig, ref: str, deadline: Deadline) -> str:
+        result = self._git(repo, ["rev-parse", "--verify", f"{ref}^{{commit}}"], deadline, check=False)
+        value = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise RunnerError("git_verification_failed", f"Git could not resolve a required immutable commit for {repo.repo_id}")
+        return value
+
+    def _git(
+        self,
+        repo: RepoConfig,
+        args: list[str],
+        deadline: Deadline,
+        *,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        env = safe_subprocess_env()
+        env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"})
+        return run_command(
+            [GIT_BIN, "-C", str(repo.path), *args],
+            env=env,
+            timeout=deadline.remaining(120),
+            check=check,
+        )
 
 
 class HostStatusCollector:
@@ -1504,7 +2123,8 @@ class CodexWriteWorkspace:
                     os.chmod(candidate, 0o444)
         for raw in self.allowed_paths:
             target = self._resolve_relative(workspace_root, raw)
-            ancestor = target.parent if target != workspace_root else workspace_root
+            target_resolved = target.resolve()
+            ancestor = target if target_resolved == workspace_resolved else target.parent
             while True:
                 os.chmod(ancestor, 0o755)
                 if ancestor.resolve() == workspace_resolved:
@@ -1591,6 +2211,8 @@ class CodexWriteWorkspace:
         source_entries = {entry.name: entry for entry in source.iterdir()}
         target_entries = {entry.name: entry for entry in target.iterdir()} if target.exists() else {}
         for name in sorted(set(target_entries) - set(source_entries)):
+            if name == ".git":
+                continue
             candidate = target_entries[name]
             if candidate.is_dir():
                 shutil.rmtree(candidate)
@@ -1617,6 +2239,7 @@ class Runner:
         self.result_validator = SimpleSchemaValidator(load_json(config.result_schema_path))
         self.profiles = ProfileStore(config.profiles_dir)
         self.worktrees = WorktreeManager(config)
+        self.sync = GitSyncManager(config)
         self.host = HostStatusCollector(config)
         self.ollama = OllamaClient(config)
         self.supervisor = CodexSupervisor(config)
@@ -1677,22 +2300,117 @@ class Runner:
         if current and current["status"] == "CANCELLED":
             raise RunnerError("job_cancelled", f"Job {job_id}/{attempt} was cancelled")
 
+    def _effective_allowed_paths(self, payload: dict[str, Any]) -> list[str]:
+        paths = list(payload.get("allowed_paths") or payload.get("scope", {}).get("paths", []) or [])
+        if payload.get("permission_profile") in {"standard-worktree", "operational", "privileged"} and not paths:
+            return ["."]
+        return paths
+
+    def _effective_verification_profiles(self, payload: dict[str, Any]) -> list[str]:
+        verification_profiles = payload.get("verification_profiles") or []
+        if verification_profiles:
+            return list(verification_profiles)
+        test_profile = payload.get("test_profile")
+        return [test_profile] if isinstance(test_profile, str) and test_profile else []
+
+    def _is_operational_job(self, payload: dict[str, Any]) -> bool:
+        return payload.get("permission_profile") in {"operational", "privileged"}
+
+    def _is_sync_capability_job(self, payload: dict[str, Any]) -> bool:
+        return payload.get("task_type") == "sync" or payload.get("capabilities") == ["sync-registered-repo"]
+
+    def _require_capability_enabled(self, name: str) -> CapabilityConfig:
+        binding = self.config.capability_config.get(name, CapabilityConfig(enabled=False))
+        if not binding.enabled:
+            raise RunnerError("capability_unavailable", f"Capability {name} is not enabled for this Runner")
+        return binding
+
+    def _assert_owner_approval(self, payload: dict[str, Any], capability: str) -> None:
+        approval = payload.get("owner_approval")
+        if payload.get("permission_profile") != "privileged":
+            return
+        if not self.config.owner_pubkey:
+            raise RunnerError("owner_approval_not_configured", "privileged jobs require a configured owner pubkey on the Mac")
+        if not isinstance(approval, dict):
+            raise RunnerError("missing_owner_approval", "privileged jobs require owner_approval")
+        if approval.get("approved_by") != self.config.owner_pubkey:
+            raise RunnerError("invalid_owner_approval", "owner_approval.approved_by does not match configured owner")
+        approved_at = parse_iso8601(str(approval.get("approved_at", "")))
+        now = dt.datetime.now(dt.timezone.utc)
+        if approved_at > now + dt.timedelta(minutes=5):
+            raise RunnerError("invalid_owner_approval", "owner_approval.approved_at is in the future")
+        if approved_at < now - dt.timedelta(days=30):
+            raise RunnerError("invalid_owner_approval", "owner_approval.approved_at is too old")
+        if not str(approval.get("approval_ref", "")).strip():
+            raise RunnerError("invalid_owner_approval", "owner_approval.approval_ref must be non-empty")
+        binding = self.config.capability_config.get(capability, CapabilityConfig(enabled=False))
+        expected_summary = self._owner_approval_summary(payload, capability, binding)
+        if approval.get("summary") != expected_summary:
+            raise RunnerError("invalid_owner_approval", "owner_approval.summary does not exactly match the approved deterministic action")
+
+    def _owner_approval_summary(self, payload: dict[str, Any], capability: str, binding: CapabilityConfig) -> str:
+        parts = [
+            f"capability={capability}",
+            f"repo={payload['repo_id']}",
+            f"job={payload['job_id']}",
+            f"attempt={payload['attempt']}",
+        ]
+        if capability == "restart-user-service" and len(binding.service_labels) == 1:
+            parts.append(f"service={binding.service_labels[0]}")
+        if capability == "install-user-tool" and binding.fixed_name:
+            parts.append(f"tool={binding.fixed_name}")
+        if capability in {"push-task-branch", "manage-pr"}:
+            parts.append(f"branch=job/{payload['job_id']}")
+        return ";".join(parts)
+
+    def _validate_policy_constraints(self, payload: dict[str, Any]) -> None:
+        permission_profile = payload["permission_profile"]
+        scope = payload["scope"]
+        network = payload["network"]
+        if permission_profile == "observe":
+            if scope["root"] not in {"metadata-only", "worktree"}:
+                raise RunnerError("invalid_scope", "observe jobs may only use metadata-only or worktree scope")
+            if network["mode"] != "none":
+                raise RunnerError("network_not_allowed", "observe jobs must use network.mode=none")
+        elif permission_profile == "standard-worktree":
+            if scope["root"] != "worktree":
+                raise RunnerError("invalid_scope", "standard-worktree jobs must use scope.root=worktree")
+        elif permission_profile in {"operational", "privileged"}:
+            if scope["root"] != "registered-checkout":
+                raise RunnerError("invalid_scope", f"{permission_profile} jobs must use scope.root=registered-checkout")
+            capabilities = payload["capabilities"]
+            if len(capabilities) != 1:
+                raise RunnerError("capability_required", f"{permission_profile} jobs must authorize exactly one capability")
+            capability = capabilities[0]
+            if capability not in OPERATIONAL_CAPABILITIES:
+                raise RunnerError("capability_unavailable", f"Capability {capability} is not allowlisted")
+            self._require_capability_enabled(capability)
+            if payload["required_capabilities"] and any(item in OPERATIONAL_CAPABILITIES for item in payload["required_capabilities"]):
+                raise RunnerError("capability_field_conflict", "required_capabilities may not be used as execution authorization")
+            if capability == "restart-user-service" and network["mode"] != "none":
+                raise RunnerError("network_not_allowed", "restart-user-service must use network.mode=none")
+            if capability in {"sync-registered-repo", "push-task-branch", "manage-pr", "install-user-tool"} and network["mode"] != "declared-remotes-and-registries":
+                raise RunnerError("network_not_allowed", f"{capability} requires network.mode=declared-remotes-and-registries")
+            if permission_profile == "privileged":
+                self._assert_owner_approval(payload, capability)
+
     def validate_payload(self, payload: dict[str, Any]) -> None:
-        self.job_validator.validate(payload)
         if payload["repo_id"] not in self.config.repos:
             raise RunnerError("unknown_repo", f"Repo {payload['repo_id']} is not in the allowlist")
-        self.profiles.load(payload["test_profile"])
         repo = self.worktrees.repo(payload["repo_id"])
-        if repo.test_profiles and payload["test_profile"] not in repo.test_profiles:
+        verification_profiles = self._effective_verification_profiles(payload)
+        for test_profile in verification_profiles:
+            self.profiles.load(test_profile)
+        if repo.test_profiles and any(profile not in repo.test_profiles for profile in verification_profiles):
+            disallowed = [profile for profile in verification_profiles if profile not in repo.test_profiles]
             raise RunnerError(
                 "test_profile_not_allowed",
-                f"Test profile {payload['test_profile']} is not allowed for repo {payload['repo_id']}",
-                details={"allowed_profiles": list(repo.test_profiles)},
+                f"Test profile {disallowed[0]} is not allowed for repo {payload['repo_id']}",
+                details={"allowed_profiles": list(repo.test_profiles), "requested_profiles": verification_profiles},
             )
-        if payload["write"] and not self.config.supervisor_allow_write_tasks:
+        self._validate_policy_constraints(payload)
+        if payload["permission_profile"] == "standard-worktree" and not self.config.supervisor_allow_write_tasks:
             raise RunnerError("write_tasks_disabled", "Write tasks are disabled by config")
-        if payload["write"] and not payload["allowed_paths"]:
-            raise RunnerError("write_requires_allowed_paths", "Write jobs must declare allowed_paths")
         unavailable_capabilities = sorted(
             capability
             for capability in payload["required_capabilities"]
@@ -1705,28 +2423,61 @@ class Runner:
                 details={"capabilities": unavailable_capabilities},
             )
         dummy_root = self.config.worktree_root / "validation"
-        self.worktrees.allowed_roots(dummy_root, payload["allowed_paths"])
-        self.worktrees.assert_exact_commit(repo, payload["base_sha"])
-        self.worktrees.assert_exact_commit(repo, payload["target_sha"])
+        self.worktrees.allowed_roots(dummy_root, self._effective_allowed_paths(payload))
+        if self._is_sync_capability_job(payload):
+            self.sync.assert_configured(repo)
+            if verification_profiles != [SYNC_TEST_PROFILE]:
+                raise RunnerError("sync_profile_required", f"Sync jobs must use only {SYNC_TEST_PROFILE}")
+            if payload["permission_profile"] not in {"operational", "privileged"} and not payload["write"]:
+                raise RunnerError("sync_write_required", "Legacy sync jobs must explicitly enable the controlled checkout update")
+            if self._effective_allowed_paths(payload) != ["."]:
+                raise RunnerError("sync_scope_invalid", "Sync jobs must declare the repository root as their only allowed path")
+            if payload["policy_version"] == POLICY_V2:
+                if payload["capabilities"] != ["sync-registered-repo"]:
+                    raise RunnerError("sync_capability_required", "policy-v2 sync jobs must authorize sync-registered-repo")
+            elif payload["required_capabilities"] != ["git"]:
+                raise RunnerError("sync_capability_required", "Sync jobs must require exactly the allowlisted git capability")
+            return
+        network_mode = payload.get("network", {}).get("mode", "none")
+        self.worktrees.assert_exact_commit(repo, payload["base_sha"], network_mode=network_mode)
+        self.worktrees.assert_exact_commit(repo, payload["target_sha"], network_mode=network_mode)
+        self.worktrees.assert_no_sensitive_paths(repo, payload["target_sha"], network_mode=network_mode)
+        if self._is_operational_job(payload):
+            return
+        if payload["execution_route"] == "ornith-then-codex":
+            raise RunnerError("execution_route_not_allowed", "ornith-then-codex is accepted only for deterministic sync audit compatibility")
+        if SYNC_TEST_PROFILE in verification_profiles:
+            raise RunnerError("test_profile_task_mismatch", f"{SYNC_TEST_PROFILE} is reserved for sync jobs")
+
+    def validate_dry_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.job_validator.validate(payload)
+        normalized, wire_meta = normalize_job_payload(payload)
+        self.validate_payload(normalized)
+        return {"status": "VALIDATED", "dry_run": True, "payload": normalized, **wire_meta}
 
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             self.job_validator.validate(payload)
+            normalized, wire_meta = normalize_job_payload(payload)
         except RunnerError as exc:
             return {"status": "REJECTED", "payload": payload, "error": exc.as_dict()}
         try:
-            row = self.ledger.insert_job(payload)
+            row = self.ledger.insert_job(
+                normalized,
+                wire_payload=wire_meta["wire_payload"],
+                wire_payload_hash=wire_meta["wire_payload_hash"],
+            )
         except RunnerError as exc:
-            return {"status": "REJECTED", "payload": payload, "error": exc.as_dict()}
+            return {"status": "REJECTED", "payload": normalized, "error": exc.as_dict()}
         if row["status"] != "RECEIVED":
             return row
         try:
-            self.validate_payload(payload)
-            return self.ledger.transition(payload["job_id"], payload["attempt"], {"RECEIVED"}, "VALIDATED")
+            self.validate_payload(normalized)
+            return self.ledger.transition(normalized["job_id"], normalized["attempt"], {"RECEIVED"}, "VALIDATED")
         except RunnerError as exc:
             return self.ledger.transition(
-                payload["job_id"],
-                payload["attempt"],
+                normalized["job_id"],
+                normalized["attempt"],
                 {"RECEIVED"},
                 "REJECTED",
                 error=exc.as_dict(),
@@ -1745,12 +2496,28 @@ class Runner:
         return self.ledger.transition(job_id, attempt, set(STATE_SEQUENCE) - TERMINAL_STATES, "CANCELLED")
 
     def status(self) -> dict[str, Any]:
+        task_types = self.job_validator.schema["properties"]["task_type"]["enum"]
+        repos = {
+            repo_id: {
+                "path": str(repo.path),
+                "test_profiles": list(repo.test_profiles),
+                "sync": {
+                    "enabled": repo.sync_enabled,
+                    "remote_url": repo.canonical_remote_url if repo.sync_enabled else None,
+                    "remote": repo.sync_remote if repo.sync_enabled else None,
+                    "branch": repo.sync_branch if repo.sync_enabled else None,
+                },
+            }
+            for repo_id, repo in sorted(self.config.repos.items())
+        }
         return {
             "capabilities": self.config.capabilities,
             "host": self.host.collect(),
             "ollama": self.ollama.status(timeout=5),
             "queue": self.ledger.queue_counts(),
             "git": {"worktrees": len(list(self.config.worktree_root.glob("*/*"))), "dirty_outside_jobs": False},
+            "runner": {"write_enabled": self.config.supervisor_allow_write_tasks, "task_types": task_types},
+            "repos": repos,
         }
 
     def serve(self, *, poll_seconds: int, heartbeat_seconds: int, busy_summary_seconds: int) -> None:
@@ -1793,6 +2560,10 @@ class Runner:
             job = self._select_job(job_id, attempt)
             if job["status"] in TERMINAL_STATES:
                 return job
+            if self._is_sync_capability_job(job["payload"]):
+                return self._execute_sync(job)
+            if self._is_operational_job(job["payload"]):
+                return self._execute_capability(job)
             deadline = Deadline(job["payload"]["deadline_seconds"])
             lease = utc_now() + min(self.config.active_lease_seconds, job["payload"]["deadline_seconds"])
             repo = self.worktrees.repo(job["payload"]["repo_id"])
@@ -1822,12 +2593,19 @@ class Runner:
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"PREPARING"}, "RUNNING", lease_expires=lease)
                 worker_result = self._run_worker(job, worktree, deadline)
                 artifacts["worker_result"] = self._write_artifact(job, "worker-result", worker_result)
-                if job["payload"]["write"]:
+                if job["payload"]["permission_profile"] == "standard-worktree":
                     self._pretest_write_gate(job, worktree)
                 self._assert_not_cancelled(job["job_id"], job["attempt"])
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"RUNNING"}, "VERIFYING", lease_expires=lease)
                 tests = self._run_tests(job, worktree, deadline)
                 artifacts["tests"] = self._write_artifact(job, "tests", tests)
+                if tests.get("exit_code"):
+                    failing = next((item for item in tests.get("profiles", []) if item.get("exit_code")), None)
+                    raise RunnerError(
+                        "test_profile_failed",
+                        f"Test profile {failing['profile'] if failing else 'unknown'} exited with code {tests['exit_code']}",
+                        details={"tests": tests},
+                    )
                 result = self._finalize(job, worktree, worker_result, tests, deadline, route=route, artifacts=artifacts)
                 artifacts["acceptance"] = str(self._artifact_path(job, "acceptance"))
                 artifacts["result"] = str(self._artifact_path(job, "result"))
@@ -1883,6 +2661,420 @@ class Runner:
                 if worktree is not None:
                     self.worktrees.cleanup(repo, worktree)
 
+    def _execute_sync(self, job: dict[str, Any]) -> dict[str, Any]:
+        deadline = Deadline(job["payload"]["deadline_seconds"])
+        lease = utc_now() + min(self.config.active_lease_seconds, job["payload"]["deadline_seconds"])
+        repo = self.worktrees.repo(job["payload"]["repo_id"])
+        prepared = False
+        try:
+            with self.sync.lock(repo):
+                if job["status"] == "VALIDATED":
+                    route = {"route": "sync", "reason": "Deterministic allowlisted repository synchronization"}
+                    job = self.ledger.transition(
+                        job["job_id"],
+                        job["attempt"],
+                        {"VALIDATED"},
+                        "SUPERVISING",
+                        route="sync",
+                        note=route,
+                        lease_expires=lease,
+                    )
+                    job = self.ledger.transition(
+                        job["job_id"],
+                        job["attempt"],
+                        {"SUPERVISING"},
+                        "PREPARING",
+                        route="sync",
+                        lease_expires=lease,
+                    )
+                    preflight = self.sync.preflight(repo, job["payload"], deadline)
+                    job = self.ledger.transition(
+                        job["job_id"],
+                        job["attempt"],
+                        {"PREPARING"},
+                        "RUNNING",
+                        route="sync",
+                        note={"preflight": preflight},
+                        lease_expires=lease,
+                    )
+                    job = self.ledger.transition(
+                        job["job_id"],
+                        job["attempt"],
+                        {"RUNNING"},
+                        "VERIFYING",
+                        route="sync",
+                        note={"phase": "apply_and_verify"},
+                        lease_expires=lease,
+                    )
+                    prepared = True
+                elif job["status"] != "VERIFYING":
+                    raise RunnerError("invalid_state_transition", f"Cannot execute sync job from {job['status']}")
+                outcome = self.sync.apply_and_verify(repo, job["payload"], deadline, prepared=prepared)
+                route = {"route": "sync", "reason": "Deterministic allowlisted repository synchronization"}
+                findings = [
+                    {
+                        "severity": "info",
+                        "title": "Repository synchronized",
+                        "detail": (
+                            f"{outcome['repo_id']} {outcome['branch']} moved from {outcome['before_sha']} "
+                            f"to {outcome['after_sha']} using a fixed fast-forward-only operation."
+                        ),
+                    }
+                ]
+                worker_result = {"route": "sync", "findings": findings, "errors": []}
+                tests = {"profile": SYNC_TEST_PROFILE, "exit_code": 0, "sync": outcome}
+                acceptance = {
+                    "accepted": True,
+                    "summary": "Configured checkout, branch, remote, target SHA, fast-forward relation, and clean final status verified.",
+                    "errors": [],
+                }
+                artifacts = {
+                    "route_decision": str(self._artifact_path(job, "route-decision")),
+                    "worker_result": str(self._artifact_path(job, "worker-result")),
+                    "tests": str(self._artifact_path(job, "tests")),
+                    "acceptance": str(self._artifact_path(job, "acceptance")),
+                    "result": str(self._artifact_path(job, "result")),
+                }
+                result = {
+                    "job_id": job["payload"]["job_id"],
+                    "attempt": job["payload"]["attempt"],
+                    "status": "DONE",
+                    "route": "sync",
+                    "findings": findings,
+                    "test_exit_code": 0,
+                    "diff_hash": sha256_hex(
+                        json_dumps({"before_sha": outcome["before_sha"], "after_sha": outcome["after_sha"]}).encode("utf-8")
+                    ),
+                    "commit_sha": outcome["after_sha"],
+                    "duration_seconds": round(deadline.elapsed(), 3),
+                    "errors": [],
+                    "supervisor": {"decision": route, "acceptance": acceptance},
+                    "artifacts": artifacts,
+                }
+                self.result_validator.validate(result)
+                self._write_artifact(job, "route-decision", route)
+                self._write_artifact(job, "worker-result", worker_result)
+                self._write_artifact(job, "tests", tests)
+                self._write_artifact(job, "acceptance", acceptance)
+                self._write_artifact(job, "result", result)
+                return self.ledger.transition(job["job_id"], job["attempt"], {"VERIFYING"}, "DONE", result=result)
+        except RunnerError as exc:
+            current = self.ledger.get_job(job["job_id"], job["attempt"])
+            if current and current["status"] in TERMINAL_STATES:
+                return current
+            if current:
+                return self.ledger.transition(
+                    current["job_id"],
+                    current["attempt"],
+                    set(STATE_SEQUENCE) - TERMINAL_STATES,
+                    "FAILED" if current["status"] != "RECEIVED" else "REJECTED",
+                    error=exc.as_dict(),
+                )
+            raise
+
+    def _execute_capability(self, job: dict[str, Any]) -> dict[str, Any]:
+        payload = job["payload"]
+        capability = payload["capabilities"][0]
+        profile_route = "privileged" if payload["permission_profile"] == "privileged" else "operational"
+        deadline = Deadline(payload["deadline_seconds"])
+        lease = utc_now() + min(self.config.active_lease_seconds, payload["deadline_seconds"])
+        repo = self.worktrees.repo(payload["repo_id"])
+        try:
+            if job["status"] == "VALIDATED":
+                route = {"route": profile_route, "reason": f"Deterministic capability handler for {capability}"}
+                job = self.ledger.transition(job["job_id"], job["attempt"], {"VALIDATED"}, "SUPERVISING", route=profile_route, note=route, lease_expires=lease)
+                self._write_artifact(job, "route-decision", route)
+                job = self.ledger.transition(job["job_id"], job["attempt"], {"SUPERVISING"}, "PREPARING", route=profile_route, lease_expires=lease)
+                tests = self._run_capability_verification(job, repo, deadline)
+                self._write_artifact(job, "tests", tests)
+                self._assert_not_cancelled(job["job_id"], job["attempt"])
+                if tests.get("exit_code"):
+                    failing = next((item for item in tests.get("profiles", []) if item.get("exit_code")), None)
+                    raise RunnerError(
+                        "test_profile_failed",
+                        f"Test profile {failing['profile'] if failing else 'unknown'} exited with code {tests['exit_code']}",
+                        details={"tests": tests},
+                    )
+                self._assert_not_cancelled(job["job_id"], job["attempt"])
+                job = self.ledger.transition(job["job_id"], job["attempt"], {"PREPARING"}, "RUNNING", route=profile_route, note={"capability": capability}, lease_expires=lease)
+                self._assert_not_cancelled(job["job_id"], job["attempt"])
+                outcome = self._dispatch_capability(capability, repo, payload, deadline)
+                findings = [outcome["finding"]]
+                worker_result = {"route": profile_route, "findings": findings, "errors": [], "outcome": outcome["result"]}
+                self._write_artifact(job, "worker-result", worker_result)
+                job = self.ledger.transition(job["job_id"], job["attempt"], {"RUNNING"}, "VERIFYING", route=profile_route, lease_expires=lease)
+            elif job["status"] == "VERIFYING":
+                route = self._read_artifact(job, "route-decision")
+                worker_result = self._read_artifact(job, "worker-result")
+                tests = self._read_artifact(job, "tests")
+                findings = worker_result["findings"]
+            else:
+                raise RunnerError("invalid_state_transition", f"Cannot execute capability job from {job['status']}")
+            outcome_data = worker_result.get("outcome", {})
+            acceptance = {"accepted": True, "summary": f"{capability} completed deterministically", "errors": []}
+            result = {
+                "job_id": payload["job_id"],
+                "attempt": payload["attempt"],
+                "status": "DONE",
+                "route": profile_route,
+                "findings": findings,
+                "test_exit_code": tests.get("exit_code"),
+                "diff_hash": sha256_hex(canonical_json_bytes(outcome_data)),
+                "commit_sha": outcome_data.get("commit_sha"),
+                "duration_seconds": round(deadline.elapsed(), 3),
+                "errors": [],
+                "supervisor": {"decision": route, "acceptance": acceptance},
+                "artifacts": {
+                    "route_decision": str(self._artifact_path(job, "route-decision")),
+                    "worker_result": str(self._artifact_path(job, "worker-result")),
+                    "tests": str(self._artifact_path(job, "tests")),
+                    "acceptance": str(self._artifact_path(job, "acceptance")),
+                    "result": str(self._artifact_path(job, "result")),
+                },
+            }
+            self.result_validator.validate(result)
+            self._write_artifact(job, "acceptance", acceptance)
+            self._write_artifact(job, "result", result)
+            return self.ledger.transition(job["job_id"], job["attempt"], {"VERIFYING"}, "DONE", result=result)
+        except RunnerError as exc:
+            current = self.ledger.get_job(job["job_id"], job["attempt"])
+            if current and current["status"] in TERMINAL_STATES:
+                return current
+            if current:
+                return self.ledger.transition(
+                    current["job_id"],
+                    current["attempt"],
+                    set(STATE_SEQUENCE) - TERMINAL_STATES,
+                    "FAILED" if current["status"] != "RECEIVED" else "REJECTED",
+                    error=exc.as_dict(),
+                )
+            raise
+
+    def _run_capability_verification(self, job: dict[str, Any], repo: RepoConfig, deadline: Deadline) -> dict[str, Any]:
+        profiles = self._effective_verification_profiles(job["payload"])
+        if not profiles:
+            return {"profile": None, "exit_code": 0}
+        worktree = self.worktrees.prepare({**job, "payload": {**job["payload"], "write": False}}, deadline)
+        try:
+            return self._run_tests(job, worktree, deadline)
+        finally:
+            self.worktrees.cleanup(repo, worktree)
+
+    def _dispatch_capability(self, capability: str, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        if capability == "push-task-branch":
+            return self._capability_push_task_branch(repo, payload, deadline)
+        if capability == "manage-pr":
+            return self._capability_manage_pr(repo, payload, deadline)
+        if capability == "install-user-tool":
+            return self._capability_install_user_tool(repo, payload, deadline)
+        if capability == "restart-user-service":
+            return self._capability_restart_user_service(payload, deadline)
+        raise RunnerError("capability_unavailable", f"Unsupported capability: {capability}")
+
+    def _assert_remote_matches_canonical(self, repo: RepoConfig, remote: str, deadline: Deadline) -> None:
+        remote_urls = self.sync._git(repo, ["remote", "get-url", "--all", remote], deadline, check=False)
+        urls = [line for line in remote_urls.stdout.splitlines() if line]
+        if remote_urls.returncode != 0 or urls != [repo.canonical_remote_url]:
+            raise RunnerError("wrong_remote", f"Configured remote for {repo.repo_id} does not match its canonical allowlist URL")
+
+    def _capability_push_task_branch(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        binding = self._require_capability_enabled("push-task-branch")
+        remote = binding.remote or repo.sync_remote
+        if not remote:
+            raise RunnerError("capability_not_configured", "push-task-branch requires a configured remote binding")
+        self._assert_remote_matches_canonical(repo, remote, deadline)
+        branch = f"job/{payload['job_id']}"
+        if not any(branch.startswith(prefix) for prefix in (binding.allowed_branch_prefixes or ("job/",))):
+            raise RunnerError("protected_branch", "Derived task branch is outside the configured push allowlist")
+        if any(branch == prefix.rstrip("/") or branch.startswith(prefix) for prefix in binding.protected_branch_prefixes):
+            raise RunnerError("protected_branch", "Derived task branch matches a protected branch prefix")
+        self.worktrees.assert_exact_commit(repo, payload["target_sha"], deadline)
+        env = safe_subprocess_env()
+        env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"})
+        existing = run_command([GIT_BIN, "-C", str(repo.path), "ls-remote", "--heads", remote, branch], env=env, timeout=deadline.remaining(30), check=False)
+        if existing.returncode != 0:
+            raise RunnerError("remote_query_failed", f"Could not query remote branch state for {branch}")
+        line = existing.stdout.strip()
+        if line:
+            remote_sha = line.split()[0]
+            run_command(
+                [GIT_BIN, "-C", str(repo.path), "fetch", "--no-tags", "--no-prune", remote, f"refs/heads/{branch}:refs/remotes/{remote}/{branch}"],
+                env=env,
+                timeout=deadline.remaining(30),
+                check=False,
+            )
+            ancestor = run_command([GIT_BIN, "-C", str(repo.path), "merge-base", "--is-ancestor", remote_sha, payload["target_sha"]], env=env, timeout=deadline.remaining(30), check=False)
+            if ancestor.returncode == 1:
+                raise RunnerError("push_requires_force", "Remote task branch would require force push")
+            if ancestor.returncode != 0:
+                raise RunnerError("git_verification_failed", "Unable to verify no-force push ancestry")
+        run_command([GIT_BIN, "-C", str(repo.path), "push", "--no-verify", remote, f"{payload['target_sha']}:refs/heads/{branch}"], env=env, timeout=deadline.remaining(60))
+        after = run_command([GIT_BIN, "-C", str(repo.path), "ls-remote", "--heads", remote, branch], env=env, timeout=deadline.remaining(30), check=False)
+        after_parts = after.stdout.strip().split()
+        if after.returncode != 0 or not after_parts or after_parts[0] != payload["target_sha"]:
+            raise RunnerError("push_postcondition_failed", "Remote task branch did not end at the requested immutable target SHA")
+        return {
+            "finding": {
+                "severity": "info",
+                "title": "Task branch pushed",
+                "detail": f"Pushed immutable commit {payload['target_sha']} to {remote}/{branch} without force.",
+            },
+            "result": {"remote": remote, "branch": branch, "commit_sha": payload["target_sha"]},
+        }
+
+    def _capability_manage_pr(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        binding = self._require_capability_enabled("manage-pr")
+        remote = binding.remote or repo.sync_remote
+        if not remote or not repo.sync_branch:
+            raise RunnerError("capability_not_configured", "manage-pr requires a configured remote and base branch")
+        self._assert_remote_matches_canonical(repo, remote, deadline)
+        branch = f"job/{payload['job_id']}"
+        if not any(branch.startswith(prefix) for prefix in (binding.allowed_branch_prefixes or ("job/",))):
+            raise RunnerError("protected_branch", "Derived task branch is outside the configured PR allowlist")
+        gh_bin = shutil.which("gh")
+        if not gh_bin:
+            raise RunnerError("command_not_found", "manage-pr requires gh to be installed on the Mac")
+        if not repo.canonical_remote_url or "github.com" not in repo.canonical_remote_url:
+            raise RunnerError("capability_not_configured", "manage-pr currently supports only configured GitHub remotes")
+        title = f"{branch}"
+        body = f"Source channel: {payload.get('metadata', {}).get('source_channel_id', 'unknown')}\nSource event: {payload.get('metadata', {}).get('source_event_id', 'unknown')}"
+        env = safe_subprocess_env()
+        branch_ref = run_command(
+            [GIT_BIN, "-C", str(repo.path), "ls-remote", "--heads", remote, branch],
+            env=env,
+            timeout=deadline.remaining(30),
+            check=False,
+        )
+        branch_parts = branch_ref.stdout.strip().split()
+        if branch_ref.returncode != 0 or not branch_parts or branch_parts[0] != payload["target_sha"]:
+            raise RunnerError("pr_branch_mismatch", "Task branch on the configured remote does not point to the requested immutable target SHA")
+        existing = run_command(
+            [gh_bin, "pr", "view", branch, "--repo", repo.canonical_remote_url, "--json", "number,url,headRefName,baseRefName"],
+            env=env,
+            timeout=deadline.remaining(30),
+            check=False,
+        )
+        if existing.returncode == 0:
+            pr_data = json.loads(existing.stdout or "{}")
+            if pr_data.get("headRefName") != branch or pr_data.get("baseRefName") != repo.sync_branch:
+                raise RunnerError("pr_state_invalid", "Existing PR does not match the deterministic task branch/base branch")
+            run_command(
+                [gh_bin, "pr", "edit", str(pr_data["number"]), "--repo", repo.canonical_remote_url, "--title", title, "--body", body],
+                env=env,
+                timeout=deadline.remaining(60),
+            )
+        else:
+            created = run_command(
+                [gh_bin, "pr", "create", "--repo", repo.canonical_remote_url, "--head", branch, "--base", repo.sync_branch, "--title", title, "--body", body],
+                env=env,
+                timeout=deadline.remaining(60),
+            )
+            url = created.stdout.strip().splitlines()[-1]
+        viewed = run_command(
+            [gh_bin, "pr", "view", branch, "--repo", repo.canonical_remote_url, "--json", "number,url,headRefName,baseRefName"],
+            env=env,
+            timeout=deadline.remaining(30),
+        )
+        final_pr = json.loads(viewed.stdout or "{}")
+        if (
+            final_pr.get("headRefName") != branch
+            or final_pr.get("baseRefName") != repo.sync_branch
+            or not final_pr.get("url")
+            or not final_pr.get("number")
+        ):
+            raise RunnerError("pr_postcondition_failed", "Final PR state did not match the deterministic branch/base/identity requirements")
+        if existing.returncode != 0 and final_pr.get("url") != url:
+            raise RunnerError("pr_postcondition_failed", "Created PR URL did not match the final PR view")
+        return {
+            "finding": {
+                "severity": "info",
+                "title": "Task PR managed",
+                "detail": f"Ensured a PR exists for {branch} targeting {repo.sync_branch}; merge was not attempted.",
+            },
+            "result": {"branch": branch, "base_branch": repo.sync_branch, "pr_number": final_pr.get("number"), "pr_url": final_pr.get("url"), "commit_sha": payload["target_sha"]},
+        }
+
+    def _capability_install_user_tool(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        _ = repo
+        _ = payload
+        binding = self._require_capability_enabled("install-user-tool")
+        if not binding.fixed_name or not binding.fixed_source or not binding.fixed_version:
+            raise RunnerError("capability_not_configured", "install-user-tool requires fixed_name, fixed_source, and fixed_version bindings")
+        if binding.fixed_source == "pipx":
+            pipx_bin = shutil.which("pipx")
+            if not pipx_bin:
+                raise RunnerError("command_not_found", "pipx is required for install-user-tool")
+            args = [pipx_bin, "install", f"{binding.fixed_name}=={binding.fixed_version}"]
+        else:
+            raise RunnerError("capability_not_configured", "install-user-tool currently supports only fixed pipx installations")
+        env = safe_subprocess_env()
+        env["CI"] = "1"
+        run_command(args, env=env, timeout=deadline.remaining(300))
+        listed = run_command([pipx_bin, "list", "--json"], env=env, timeout=deadline.remaining(30))
+        listed_json = json.loads(listed.stdout or "{}")
+        venvs = listed_json.get("venvs", {})
+        details = venvs.get(binding.fixed_name)
+        if not isinstance(details, dict):
+            raise RunnerError("install_postcondition_failed", f"pipx did not report installed tool {binding.fixed_name}")
+        metadata = details.get("metadata", {})
+        package_version = metadata.get("package_version")
+        if binding.fixed_version and package_version != binding.fixed_version:
+            raise RunnerError("install_postcondition_failed", "Installed package version did not match the configured fixed_version")
+        executable = shutil.which(binding.fixed_name)
+        if not executable:
+            raise RunnerError("install_postcondition_failed", "Installed tool is not on PATH after installation")
+        return {
+            "finding": {
+                "severity": "info",
+                "title": "User tool installed",
+                "detail": f"Installed fixed user tool {binding.fixed_name} from {binding.fixed_source} without sudo.",
+            },
+            "result": {"tool": binding.fixed_name, "version": binding.fixed_version, "source": binding.fixed_source, "path": executable},
+        }
+
+    def _capability_restart_user_service(self, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        _ = payload
+        binding = self._require_capability_enabled("restart-user-service")
+        if len(binding.service_labels) != 1:
+            raise RunnerError("capability_not_configured", "restart-user-service requires exactly one configured service label")
+        label = binding.service_labels[0]
+        if self.config.service_label and label == self.config.service_label:
+            raise RunnerError(
+                "capability_not_configured",
+                f"restart-user-service is fail-closed for the Runner service {label} until a one-shot helper is implemented",
+            )
+        uid = str(os.getuid())
+        env = safe_subprocess_env()
+        before = run_command(["launchctl", "print", f"gui/{uid}/{label}"], env=env, timeout=deadline.remaining(20), check=False)
+        before_pid = self._launchctl_pid(before.stdout)
+        if before.returncode != 0 or before_pid is None:
+            raise RunnerError("service_not_running", f"launchctl did not report a running PID for {label} before restart")
+        run_command(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"], env=env, timeout=deadline.remaining(30))
+        post = run_command(["launchctl", "print", f"gui/{uid}/{label}"], env=env, timeout=deadline.remaining(20), check=False)
+        after_pid = self._launchctl_pid(post.stdout)
+        if post.returncode != 0 or after_pid is None:
+            raise RunnerError("service_restart_failed", f"launchctl could not verify restarted service {label}")
+        if after_pid == before_pid:
+            raise RunnerError("service_restart_failed", f"launchctl reported the same PID for {label} after restart")
+        return {
+            "finding": {
+                "severity": "info",
+                "title": "User service restarted",
+                "detail": f"Restarted configured LaunchAgent {label} and verified launchctl status.",
+            },
+            "result": {"service": label, "before_pid": before_pid, "after_pid": after_pid, "canary": "launchctl-print-running"},
+        }
+
+    def _launchctl_pid(self, output: str) -> int | None:
+        for pattern in (r"\bpid = (\d+)\b", r"\bPID = (\d+)\b"):
+            match = re.search(pattern, output)
+            if match:
+                value = int(match.group(1))
+                return value if value > 0 else None
+        if "state = running" in output.lower():
+            return 0
+        return None
+
     def _resume_verifying(self, job: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
         route = self._read_artifact(job, "route-decision")
         worker_result = self._read_artifact(job, "worker-result")
@@ -1928,9 +3120,9 @@ class Runner:
                 workspace = worktree
                 skip_git_repo_check = False
                 codex_workspace: CodexWriteWorkspace | None = None
-                if job["payload"]["write"]:
+                if job["payload"]["permission_profile"] == "standard-worktree":
                     codex_workspace = stack.enter_context(
-                        CodexWriteWorkspace(self.config.state_dir, worktree, job["payload"]["allowed_paths"])
+                        CodexWriteWorkspace(self.config.state_dir, worktree, self._effective_allowed_paths(job["payload"]))
                     )
                     workspace = codex_workspace.path
                     skip_git_repo_check = True
@@ -2008,35 +3200,60 @@ class Runner:
         return {"route": "ornith", "findings": parsed["findings"], "errors": []}
 
     def _pretest_write_gate(self, job: dict[str, Any], worktree: Path) -> None:
-        changed_files, diff_bytes, _ = self.worktrees.write_gate(worktree, job["payload"]["allowed_paths"])
+        repo = self.worktrees.repo(job["payload"]["repo_id"])
+        changed_files, diff_bytes, _ = self.worktrees.write_gate(repo, worktree, self._effective_allowed_paths(job["payload"]))
         if changed_files > self.config.max_changed_files:
             raise RunnerError("diff_too_large", "Changed file count exceeded configured limit")
         if diff_bytes > self.config.max_diff_bytes:
             raise RunnerError("diff_too_large", "Diff bytes exceeded configured limit")
 
     def _run_tests(self, job: dict[str, Any], worktree: Path, deadline: Deadline) -> dict[str, Any]:
-        profile = self.profiles.load(job["payload"]["test_profile"])
-        needs_xcode_derived_data = TestSandbox.XCODE_DERIVED_DATA_TOKEN in profile.command
-        with TestSandbox(self.config.state_dir, worktree, needs_xcode_derived_data) as sandbox:
-            env = sandbox.env()
-            timeout = min(profile.timeout_seconds, int(deadline.remaining(profile.timeout_seconds)))
-            proc = run_command(
-                sandbox.wrap(sandbox.expand(profile.command)),
-                cwd=worktree,
-                env=env,
-                timeout=timeout,
-                check=False,
-            )
-            for key in SECRET_ENV_KEYS:
-                if key in env:
-                    raise RunnerError("secret_env_leak", f"Secret env leaked into test subprocess: {key}")
-            if proc.returncode != 0:
-                raise RunnerError(
-                    "test_profile_failed",
-                    f"Test profile {profile.name} exited with code {proc.returncode}",
-                    details={"stdout": trim_text(proc.stdout, 4000), "stderr": trim_text(proc.stderr, 4000)},
+        verification_profiles = self._effective_verification_profiles(job["payload"])
+        if not verification_profiles:
+            raise RunnerError("test_profile_missing", "Job does not declare a verification profile")
+        runs: list[VerificationRun] = []
+        overall_exit_code = 0
+        for name in verification_profiles:
+            profile = self.profiles.load(name)
+            needs_xcode_derived_data = TestSandbox.XCODE_DERIVED_DATA_TOKEN in profile.command
+            with TestSandbox(self.config.state_dir, worktree, needs_xcode_derived_data) as sandbox:
+                env = sandbox.env()
+                timeout = min(profile.timeout_seconds, int(deadline.remaining(profile.timeout_seconds)))
+                proc = run_command(
+                    sandbox.wrap(sandbox.expand(profile.command)),
+                    cwd=worktree,
+                    env=env,
+                    timeout=timeout,
+                    check=False,
                 )
-        return {"profile": profile.name, "exit_code": 0}
+                for key in SECRET_ENV_KEYS:
+                    if key in env:
+                        raise RunnerError("secret_env_leak", f"Secret env leaked into test subprocess: {key}")
+                runs.append(
+                    VerificationRun(
+                        profile=profile.name,
+                        exit_code=proc.returncode,
+                        stdout=trim_text(proc.stdout or "", 4000),
+                        stderr=trim_text(proc.stderr or "", 4000),
+                    )
+                )
+                if proc.returncode != 0 and overall_exit_code == 0:
+                    overall_exit_code = proc.returncode
+                    break
+        tests_payload = {
+            "profile": verification_profiles[0] if len(verification_profiles) == 1 else None,
+            "profiles": [
+                {
+                    "profile": run.profile,
+                    "exit_code": run.exit_code,
+                    "stdout": run.stdout,
+                    "stderr": run.stderr,
+                }
+                for run in runs
+            ],
+            "exit_code": overall_exit_code,
+        }
+        return tests_payload
 
     def _finalize(
         self,
@@ -2051,8 +3268,9 @@ class Runner:
     ) -> dict[str, Any]:
         payload = job["payload"]
         commit_sha: str | None = None
-        if payload["write"]:
-            changed_files, diff_bytes, diff_hash = self.worktrees.write_gate(worktree, payload["allowed_paths"])
+        repo = self.worktrees.repo(payload["repo_id"])
+        if payload["permission_profile"] == "standard-worktree":
+            changed_files, diff_bytes, diff_hash = self.worktrees.write_gate(repo, worktree, self._effective_allowed_paths(payload))
             if changed_files > self.config.max_changed_files:
                 raise RunnerError("diff_too_large", "Changed file count exceeded configured limit")
             if diff_bytes > self.config.max_diff_bytes:
@@ -2087,6 +3305,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     submit = subparsers.add_parser("submit")
     submit.add_argument("--file", type=Path)
+    submit.add_argument("--dry-run", action="store_true")
     get = subparsers.add_parser("get")
     get.add_argument("--job-id", required=True)
     get.add_argument("--attempt", required=True, type=int)
@@ -2123,7 +3342,8 @@ def main(argv: list[str] | None = None) -> int:
     runner = Runner(config)
     try:
         if args.command == "submit":
-            return emit(runner.submit(read_payload(args.file)))
+            payload = read_payload(args.file)
+            return emit(runner.validate_dry_run(payload) if args.dry_run else runner.submit(payload))
         if args.command == "get":
             return emit(runner.get(args.job_id, args.attempt))
         if args.command == "cancel":

@@ -11,9 +11,6 @@
     "target_sha",
     "task_type",
     "focus",
-    "write",
-    "allowed_paths",
-    "test_profile",
     "deadline_seconds",
     "supervisor",
     "execution_route",
@@ -54,7 +51,8 @@
         "review",
         "analyze",
         "fix",
-        "test"
+        "test",
+        "sync"
       ]
     },
     "focus": {
@@ -83,6 +81,117 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]{1,64}$"
     },
+    "policy_version": {
+      "type": "integer",
+      "enum": [
+        2
+      ]
+    },
+    "permission_profile": {
+      "type": "string",
+      "enum": [
+        "observe",
+        "standard-worktree",
+        "operational",
+        "privileged"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "sync-registered-repo",
+          "push-task-branch",
+          "manage-pr",
+          "install-user-tool",
+          "restart-user-service"
+        ]
+      },
+      "maxItems": 8
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "enum": [
+            "metadata-only",
+            "worktree",
+            "registered-checkout"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "maxItems": 128
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "relay-only",
+            "declared-remotes-and-registries"
+          ]
+        }
+      }
+    },
+    "verification_profiles": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]{1,64}$"
+      },
+      "maxItems": 32
+    },
+    "owner_approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approved_by",
+        "approval_ref",
+        "approved_at",
+        "summary"
+      ],
+      "properties": {
+        "approved_by": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "approval_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "approved_at": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 64
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
     "deadline_seconds": {
       "type": "integer",
       "minimum": 1,
@@ -99,7 +208,8 @@
       "enum": [
         "auto",
         "ornith",
-        "codex"
+        "codex",
+        "ornith-then-codex"
       ]
     },
     "preferred_worker": {
@@ -116,6 +226,50 @@
         "pattern": "^[A-Za-z0-9._:-]{1,64}$"
       },
       "maxItems": 32
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "instructions": {
+      "type": "string",
+      "maxLength": 20000
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 4000
+      },
+      "maxItems": 128
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "remote_url": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "branch": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "source_channel_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "source_event_id": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "context": {
+      "type": "object"
+    },
+    "extensions": {
+      "type": "object"
     }
   }
 }

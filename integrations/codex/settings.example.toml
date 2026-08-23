@@ -1,8 +1,7 @@
 enabled = false
 relay_url = "wss://relay.example.invalid"
 respond_to_allowlist = ["0000000000000000000000000000000000000000000000000000000000000000"]
-channel_ids = ["00000000-0000-0000-0000-000000000000"]
-event_kinds = [1]
+event_kinds = [9]
 subscribe = "mentions"
 
 system_prompt_file = "/absolute/path/to/integrations/codex/mac-supervisor-system-prompt.md"
@@ -16,9 +15,14 @@ auth_tag_enabled = false
 auth_tag_keychain_account = "example-auth-account"
 auth_tag_keychain_service = "example-auth-service"
 owner_public_key = "0000000000000000000000000000000000000000000000000000000000000000"
-relay_observer = false
+relay_observer = true
 
 agents = 1
-heartbeat_interval = 0
-idle_timeout_seconds = 620
+heartbeat_interval = 900
+idle_timeout_seconds = 900
 max_turn_duration_seconds = 7200
+turn_liveness_seconds = 10
+lazy_pool = true
+idle_pool_sleep_seconds = 300
+exit_after_inactivity_seconds = 0
+permission_mode = "default"

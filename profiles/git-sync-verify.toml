@@ -1,0 +1,3 @@
+command = ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"]
+timeout_seconds = 60
+description = "Reserved verification marker for deterministic allowlisted repository synchronization."

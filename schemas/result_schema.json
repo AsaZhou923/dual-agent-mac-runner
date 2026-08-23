@@ -36,7 +36,10 @@
       "type": "string",
       "enum": [
         "ornith",
-        "codex"
+        "codex",
+        "sync",
+        "operational",
+        "privileged"
       ]
     },
     "findings": {
@@ -121,7 +124,10 @@
               "type": "string",
               "enum": [
                 "ornith",
-                "codex"
+                "codex",
+                "sync",
+                "operational",
+                "privileged"
               ]
             },
             "reason": {
