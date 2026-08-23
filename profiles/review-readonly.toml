@@ -1,0 +1,3 @@
+command = ["/usr/bin/git", "diff", "--check", "HEAD"]
+timeout_seconds = 60
+description = "Reject whitespace errors in tracked and staged changes without executing repository code."

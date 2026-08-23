@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate JSON schemas
+        run: |
+          python3 -m json.tool schemas/job_schema.json >/dev/null
+          python3 -m json.tool schemas/result_schema.json >/dev/null
+      - name: Validate Python, TOML, and wrapper syntax
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import ast
+          import tomllib
+
+          for path in (
+              Path("runner.py"),
+              Path("tests/test_runner.py"),
+              Path("integrations/codex/run-buzz-acp.py"),
+          ):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+          for path in (
+              Path("examples/config.example.toml"),
+              Path("examples/profiles/backend-unit.toml"),
+              Path("profiles/review-readonly.toml"),
+              Path("integrations/codex/settings.example.toml"),
+          ):
+              tomllib.loads(path.read_text(encoding="utf-8"))
+          PY
+          zsh -n scripts/mac-runner
+      - name: Validate plist templates
+        run: |
+          plutil -lint launchd/*.plist
+          plutil -lint integrations/codex/*.plist

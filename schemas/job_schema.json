@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "job_id",
+    "attempt",
+    "repo_id",
+    "base_sha",
+    "target_sha",
+    "task_type",
+    "focus",
+    "write",
+    "allowed_paths",
+    "test_profile",
+    "deadline_seconds",
+    "supervisor",
+    "execution_route",
+    "preferred_worker",
+    "required_capabilities"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": [
+        "mac-job/v1"
+      ]
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{3,128}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "repo_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "target_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "task_type": {
+      "type": "string",
+      "enum": [
+        "review",
+        "analyze",
+        "fix",
+        "test"
+      ]
+    },
+    "focus": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "minItems": 1,
+      "maxItems": 32
+    },
+    "write": {
+      "type": "boolean"
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      },
+      "maxItems": 128
+    },
+    "test_profile": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "deadline_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400
+    },
+    "supervisor": {
+      "type": "string",
+      "enum": [
+        "mac-codex"
+      ]
+    },
+    "execution_route": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "ornith",
+        "codex"
+      ]
+    },
+    "preferred_worker": {
+      "type": "string",
+      "enum": [
+        "ornith",
+        "codex"
+      ]
+    },
+    "required_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+      },
+      "maxItems": 32
+    }
+  }
+}

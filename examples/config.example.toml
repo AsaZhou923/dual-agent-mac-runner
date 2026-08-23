@@ -1,0 +1,31 @@
+[runner]
+state_dir = "~/.local/state/mac-runner"
+db_path = "~/.local/state/mac-runner/runner.db"
+worktree_root = "~/.local/share/mac-runner/worktrees"
+artifacts_dir = "~/.local/share/mac-runner/artifacts"
+log_path = "~/.local/state/mac-runner/runner.jsonl"
+profiles_dir = "/absolute/path/to/dual-agent-mac-runner/profiles"
+job_schema_path = "/absolute/path/to/dual-agent-mac-runner/schemas/job_schema.json"
+result_schema_path = "/absolute/path/to/dual-agent-mac-runner/schemas/result_schema.json"
+max_changed_files = 16
+max_diff_bytes = 65536
+active_lease_seconds = 120
+
+[ollama]
+endpoint = "http://127.0.0.1:11434"
+model = "ornith-9b-agent"
+timeout_seconds = 90
+max_output_chars = 12000
+native_tool_calls_required = true
+
+[supervisor]
+codex_path = "codex"
+model = ""
+allow_write_tasks = false
+
+[capabilities]
+image_generation = false
+
+[repos.example]
+path = "/absolute/path/to/repository"
+test_profiles = ["review-readonly"]
