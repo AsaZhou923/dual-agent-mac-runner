@@ -34,6 +34,19 @@ Use this order when replacing a running installation:
 9. Keep the previous source, configuration, plists, and ledger backup available
    until a fresh cross-machine attempt reaches a consistent terminal state.
 
+For the fresh read-only attempt, require all of the following before declaring
+the cutover healthy:
+
+- the original thread begins with exact `ACK <job_id> <attempt>` and proceeds
+  through on-time `RUNNING`, `VERIFYING`, and one terminal state;
+- the real macOS Seatbelt profile completes `/usr/bin/git diff --check HEAD`
+  without `xcrun_db` denial while a sibling file in the same Darwin temporary
+  directory remains unwritable;
+- the structured result contains equal `config_immutability.sha256_before` and
+  `sha256_after` values with `unchanged=true`;
+- the terminal Runner row, Windows ledger, queue/worktree counts, and registered
+  checkout fingerprint agree.
+
 The migration only adds policy/wire/approval/capability columns. Existing job
 and event rows remain in place; legacy payloads are used to backfill their
 original wire JSON/hash and canonical policy-v1 fields. An exact replay must

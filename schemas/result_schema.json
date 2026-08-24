@@ -13,6 +13,7 @@
     "commit_sha",
     "duration_seconds",
     "errors",
+    "config_immutability",
     "supervisor",
     "artifacts"
   ],
@@ -103,6 +104,28 @@
         "maxLength": 2000
       },
       "maxItems": 256
+    },
+    "config_immutability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256_before",
+        "sha256_after",
+        "unchanged"
+      ],
+      "properties": {
+        "sha256_before": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sha256_after": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "unchanged": {
+          "type": "boolean"
+        }
+      }
     },
     "supervisor": {
       "type": "object",

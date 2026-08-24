@@ -11,6 +11,7 @@ from unittest import mock
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER_PATH = REPOSITORY_ROOT / "integrations" / "codex" / "run-buzz-acp.py"
+SYSTEM_PROMPT_PATH = REPOSITORY_ROOT / "integrations" / "codex" / "mac-supervisor-system-prompt.md"
 SPEC = importlib.util.spec_from_file_location("buzz_acp_launcher", LAUNCHER_PATH)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import bootstrap guard
     raise RuntimeError("could not load Buzz ACP launcher")
@@ -126,6 +127,17 @@ class BuzzLauncherTests(unittest.TestCase):
             self.assertRaisesRegex(SystemExit, "78"),
         ):
             buzz_launcher.main()
+
+    def test_supervisor_prompt_requires_ledger_recordable_state_prefixes(self) -> None:
+        prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("first reply", prompt)
+        self.assertIn("`ACK <job_id> <attempt>`", prompt)
+        self.assertIn("`RUNNING <job_id> <attempt>`", prompt)
+        self.assertIn("`VERIFYING <job_id> <attempt>`", prompt)
+        self.assertIn("`DONE <job_id> <attempt>`", prompt)
+        self.assertIn("`FAILED <job_id> <attempt>`", prompt)
+        self.assertIn("never slash or colon forms", prompt)
+        self.assertIn("backfill ACK", prompt)
 
 
 if __name__ == "__main__":

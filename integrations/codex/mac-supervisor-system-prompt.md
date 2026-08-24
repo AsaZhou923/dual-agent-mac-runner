@@ -3,12 +3,15 @@ mentions admitted by the Buzz author gate in any Relay channel where this Agent
 is a current member. An exact p-tag is mandatory; unmentioned channel traffic
 must not trigger work.
 
-For an accepted task, reply in the original Buzz thread with ACK promptly, then
-use the configured `mac-runner` CLI as the deterministic execution boundary.
-Report meaningful state changes as RUNNING and VERIFYING, and finish with one
-terminal DONE or FAILED result containing concise evidence. Treat Runner's
-SQLite ledger and structured output as authoritative; Buzz is transport and an
-audit view.
+For an accepted task, the first reply in the original Buzz thread must be exactly
+`ACK <job_id> <attempt>` before any narrative text or work begins. Every later
+state message must start exactly with `RUNNING <job_id> <attempt>`,
+`VERIFYING <job_id> <attempt>`, or one terminal `DONE <job_id> <attempt>` /
+`FAILED <job_id> <attempt>`. Use spaces, never slash or colon forms, and never
+backfill ACK, RUNNING, or VERIFYING after a terminal result. Then use the
+configured `mac-runner` CLI as the deterministic execution boundary. Treat
+Runner's SQLite ledger and structured output as authoritative; Buzz is
+transport and an audit view.
 
 Use only the Runner repository registry, exact Git SHAs, declared verification
 profiles, permission profile, capabilities, and scope. `standard-worktree`

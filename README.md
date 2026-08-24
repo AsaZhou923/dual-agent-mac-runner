@@ -29,6 +29,12 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
 - Original wire payload/hash plus canonical policy fields retained in SQLite.
 - Approved test profiles executed without `shell=True`.
 - Temporary HOME plus a no-network Seatbelt profile for tests.
+- Read-only macOS verification grants write access only to the current user's
+  `xcrun_db` cache file and its replacement file, not the surrounding Darwin
+  temporary directory.
+- Non-operational jobs hash the loaded Runner configuration before execution
+  and after Supervisor acceptance; config drift is terminal and the matching
+  hashes are exposed in the structured result.
 - Worktree writes are limited by scope, changed-file count, diff size, and
   configured sensitive-path patterns.
 - Operational actions use fixed capability handlers for reversible
@@ -73,7 +79,10 @@ The Buzz ACP launcher template is mention-only and dynamically subscribes to
 Relay channels where the Agent is a member. It enforces one Agent, Queue/Queue
 event handling, lazy child creation, a read-only heartbeat, relay observation,
 and `permission_mode=default`; it deliberately does not inject a static channel
-list or a generic MCP shell command.
+list or a generic MCP shell command. The Supervisor prompt also requires the
+first task reply and every later transition to use ledger-recordable
+`STATE <job_id> <attempt>` prefixes without backfilling states after a terminal
+result.
 
 See `docs/operations.md` for the safe cutover sequence and
 `docs/dependencies.md` for the audited dependency baseline.

@@ -5,6 +5,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import signal
 import sqlite3
 import socketserver
@@ -1889,6 +1890,8 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
     def test_seatbelt_allows_read_only_git_metadata_for_disposable_worktree(self) -> None:
         worktree = self.root / "seatbelt-worktree"
         self._run("git", "-C", str(self.repo), "worktree", "add", "--detach", str(worktree), self.base_sha)
+        denied_sibling = Path(tempfile.gettempdir()).resolve() / f"mac-runner-denied-{os.getpid()}"
+        denied_sibling.unlink(missing_ok=True)
         try:
             with runner.TestSandbox(self.root / "state-seatbelt-git", worktree) as sandbox:
                 result = runner.run_command(
@@ -1898,9 +1901,19 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                     timeout=30,
                     check=False,
                 )
+                denied = runner.run_command(
+                    sandbox.wrap(["/usr/bin/touch", str(denied_sibling)]),
+                    cwd=worktree,
+                    env=sandbox.env(),
+                    timeout=30,
+                    check=False,
+                )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("xcrun_db", result.stderr)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertFalse(denied_sibling.exists())
         finally:
+            denied_sibling.unlink(missing_ok=True)
             self._run(
                 "git",
                 "-C",
@@ -1913,18 +1926,24 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             )
             self._run("git", "-C", str(self.repo), "worktree", "prune", check=False)
 
-    def test_test_sandbox_grants_only_developer_tools_cache_on_macos(self) -> None:
-        darwin_temp = self.root / "darwin" / "T" / "session"
+    def test_test_sandbox_grants_only_xcrun_db_files_on_macos(self) -> None:
+        darwin_temp = self.root / "darwin" / "T"
         darwin_temp.mkdir(parents=True)
-        expected_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
+        resolved_temp = str(darwin_temp.resolve())
+        expected_pattern = (
+            f"(/private)?{re.escape(resolved_temp.removeprefix('/private'))}"
+            if resolved_temp.startswith("/private/var/")
+            else re.escape(resolved_temp)
+        )
         with mock.patch.object(runner.sys, "platform", "darwin"), mock.patch.dict(
             os.environ,
             {"TMPDIR": f"{darwin_temp}/"},
         ):
             with runner.TestSandbox(self.root / "state-darwin-cache", self.repo) as sandbox:
                 profile = sandbox.profile_path.read_text(encoding="utf-8")
-        self.assertIn(f"(subpath {json.dumps(str(expected_cache.resolve()))})", profile)
-        self.assertNotIn(f"(subpath {json.dumps(str(expected_cache.parent.resolve()))})", profile)
+        self.assertIn(f'(regex #"^{expected_pattern}/xcrun_db(-[^/]+)?$")', profile)
+        self.assertNotIn(f"(subpath {json.dumps(str(darwin_temp.resolve()))})", profile)
+        self.assertNotIn("com.apple.DeveloperTools", profile)
 
     def test_execute_records_config_immutability_evidence(self) -> None:
         subject = self._runner()
@@ -1942,6 +1961,57 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         changed = subject._with_config_immutability({"exit_code": 0}, before)["config_immutability"]
         self.assertNotEqual(changed["sha256_after"], expected_hash)
         self.assertFalse(changed["unchanged"])
+        subject.close()
+
+    def test_successful_result_exposes_terminal_config_immutability_evidence(self) -> None:
+        subject = self._runner()
+        subject.submit(self.sample_job)
+        with (
+            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
+            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
+            mock.patch.object(
+                subject,
+                "_run_tests",
+                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
+            ),
+            mock.patch.object(
+                subject.supervisor,
+                "accept",
+                return_value={"accepted": True, "summary": "verified", "errors": []},
+            ),
+        ):
+            done = subject.execute("agent-20260821-0042", 1)
+
+        self.assertEqual(done["status"], "DONE")
+        evidence = done["result"]["config_immutability"]
+        self.assertEqual(evidence["sha256_before"], evidence["sha256_after"])
+        self.assertTrue(evidence["unchanged"])
+        subject.close()
+
+    def test_result_schema_requires_config_immutability(self) -> None:
+        subject = self._runner()
+        subject.submit(self.sample_job)
+        with (
+            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
+            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
+            mock.patch.object(
+                subject,
+                "_run_tests",
+                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
+            ),
+            mock.patch.object(
+                subject.supervisor,
+                "accept",
+                return_value={"accepted": True, "summary": "verified", "errors": []},
+            ),
+        ):
+            done = subject.execute("agent-20260821-0042", 1)
+
+        result = dict(done["result"])
+        result.pop("config_immutability")
+        with self.assertRaises(runner.RunnerError) as error:
+            subject.result_validator.validate(result)
+        self.assertEqual(error.exception.code, "schema_validation_failed")
         subject.close()
 
     def test_config_change_after_result_creation_is_terminal(self) -> None:
@@ -1975,6 +2045,34 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertFalse(tests["config_immutability"]["unchanged"])
         self.config.config_path.write_text(original_config, encoding="utf-8")
         self.assertEqual(subject.execute("agent-20260821-0042", 1)["status"], "FAILED")
+        subject.close()
+
+    def test_config_change_during_acceptance_is_terminal(self) -> None:
+        subject = self._runner()
+        subject.submit(self.sample_job)
+        original_config = self.config.config_path.read_text(encoding="utf-8")
+
+        def mutate_during_acceptance(*args: object, **kwargs: object) -> dict[str, object]:
+            self.config.config_path.write_text(original_config + "\n# changed during acceptance\n", encoding="utf-8")
+            return {"accepted": True, "summary": "untrusted after config change", "errors": []}
+
+        with (
+            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
+            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
+            mock.patch.object(
+                subject,
+                "_run_tests",
+                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
+            ),
+            mock.patch.object(subject.supervisor, "accept", side_effect=mutate_during_acceptance),
+        ):
+            failed = subject.execute("agent-20260821-0042", 1)
+
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "config_changed_during_execution")
+        tests = json.loads(subject._artifact_path(failed, "tests").read_text(encoding="utf-8"))
+        self.assertFalse(tests["config_immutability"]["unchanged"])
+        self.config.config_path.write_text(original_config, encoding="utf-8")
         subject.close()
 
     def test_test_sandbox_resolves_linked_worktree_git_metadata_roots(self) -> None:
