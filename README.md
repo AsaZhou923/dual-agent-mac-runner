@@ -27,6 +27,9 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
 - Exact 40-character Git SHAs and a configured repository allowlist.
 - Strict top-level policy-v2 schema and a 48 KiB canonical wire-payload budget.
 - Original wire payload/hash plus canonical policy fields retained in SQLite.
+- Signed explicit `codex` or `ornith` execution routes for Supervisor-routed jobs
+  are honored deterministically; only `auto` invokes the route decision. Sync and
+  operational capabilities use the Runner's fixed path and therefore require `auto`.
 - Approved test profiles executed without `shell=True`.
 - Temporary HOME plus a no-network Seatbelt profile for tests.
 - Read-only macOS verification grants write access only to the current user's

@@ -2063,6 +2063,14 @@ class CodexSupervisor:
         return safe_subprocess_env(allow_credentials=True)
 
     def decide(self, job: dict[str, Any], status: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        requested_route = job["payload"].get("execution_route")
+        if requested_route in {"ornith", "codex"}:
+            result = {
+                "route": requested_route,
+                "reason": f"Signed job selected the explicit {requested_route} execution route",
+            }
+            self.decision_validator.validate(result)
+            return result
         prompt = textwrap.dedent(
             f"""
             TASK: decide_route
@@ -2769,6 +2777,8 @@ class Runner:
         self._validate_policy_constraints(payload)
         if payload["permission_profile"] == "standard-worktree" and not self.config.supervisor_allow_write_tasks:
             raise RunnerError("write_tasks_disabled", "Write tasks are disabled by config")
+        if payload["permission_profile"] == "standard-worktree" and payload["execution_route"] == "ornith":
+            raise RunnerError("execution_route_not_allowed", "standard-worktree jobs must use codex or auto routing")
         unavailable_capabilities = sorted(
             capability
             for capability in payload["required_capabilities"]
@@ -2779,6 +2789,17 @@ class Runner:
                 "capability_unavailable",
                 "Job requires capabilities that are not enabled for this Runner",
                 details={"capabilities": unavailable_capabilities},
+            )
+        deterministic_runner_job = self._is_sync_capability_job(payload) or self._is_operational_job(payload)
+        legacy_sync_route = (
+            payload["policy_version"] == 1
+            and self._is_sync_capability_job(payload)
+            and payload["execution_route"] == "ornith-then-codex"
+        )
+        if deterministic_runner_job and payload["execution_route"] != "auto" and not legacy_sync_route:
+            raise RunnerError(
+                "execution_route_not_allowed",
+                "Deterministic sync and operational jobs must use execution_route=auto",
             )
         dummy_root = self.config.worktree_root / "validation"
         self.worktrees.allowed_roots(dummy_root, self._effective_allowed_paths(payload))

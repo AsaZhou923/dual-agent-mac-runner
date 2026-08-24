@@ -1670,6 +1670,71 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             "maximum": 200,
         })
 
+    def test_explicit_execution_route_is_deterministic_without_route_model_call(self) -> None:
+        subject = self._runner()
+        job = self._job(execution_route="codex", preferred_worker="codex")
+        submitted = subject.submit(job)
+        with mock.patch.object(subject.supervisor, "_invoke_json") as invoke:
+            decision = subject.supervisor.decide(submitted, subject.status(), runner.Deadline(30))
+        self.assertEqual(decision["route"], "codex")
+        self.assertIn("explicit codex", decision["reason"])
+        invoke.assert_not_called()
+        subject.close()
+
+    def test_standard_worktree_rejects_explicit_ornith_route(self) -> None:
+        subject = self._runner()
+        rejected = subject.submit(
+            self._job(
+                write=True,
+                allowed_paths=["allowed.txt"],
+                execution_route="ornith",
+                preferred_worker="ornith",
+            )
+        )
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["error"]["code"], "execution_route_not_allowed")
+        subject.close()
+
+    def test_deterministic_operational_job_rejects_explicit_worker_route(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(extra_capabilities="restart-user-service = true")
+        )
+        subject = runner.Runner(config)
+        rejected = subject.submit(
+            self._policy_v2_job(
+                job_id="explicit-operational-route",
+                permission_profile="operational",
+                capabilities=["restart-user-service"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "none"},
+                execution_route="codex",
+            )
+        )
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["error"]["code"], "execution_route_not_allowed")
+        subject.close()
+
+    def test_policy_v2_sync_rejects_explicit_worker_route(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(extra_capabilities="sync-registered-repo = true")
+        )
+        subject = runner.Runner(config)
+        rejected = subject.submit(
+            self._policy_v2_job(
+                job_id="explicit-sync-route",
+                task_type="sync",
+                permission_profile="operational",
+                capabilities=["sync-registered-repo"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["git-sync-verify"],
+                execution_route="ornith",
+            )
+        )
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["error"]["code"], "execution_route_not_allowed")
+        subject.close()
+
     def test_supervisor_acceptance_recovers_without_rerunning_worker(self) -> None:
         subject = self._runner(max_diff_bytes=128)
         job = self._job(job_id="accept-retry")
