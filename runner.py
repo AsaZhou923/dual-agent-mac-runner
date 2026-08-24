@@ -1920,7 +1920,7 @@ class OllamaClient:
 
 class OrnithToolExecutor:
     def __init__(self, worktree: Path, deadline: Deadline, output_limit: int) -> None:
-        self.worktree = worktree
+        self.worktree = worktree.resolve()
         self.deadline = deadline
         self.output_limit = output_limit
 

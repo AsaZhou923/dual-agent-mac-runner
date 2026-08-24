@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import http.server
 import json
 import os
@@ -1000,7 +1001,9 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                 owner_approval={
                     "approved_by": "1" * 64,
                     "approval_ref": "oa-event-2",
-                    "approved_at": "2026-08-24T10:00:00+09:00",
+                    "approved_at": (
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+                    ).isoformat(),
                     "summary": "capability=push-task-branch;repo=repo1;job=push-priv-future;attempt=1;branch=job/push-priv-future",
                 },
             )
@@ -1022,6 +1025,45 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         failed = subject.execute("restart-self", 1)
         self.assertEqual(failed["status"], "FAILED")
         self.assertEqual(failed["error"]["code"], "capability_not_configured")
+        subject.close()
+
+    def test_future_owner_approval_is_rejected_relative_to_runtime_clock(self) -> None:
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="push-task-branch = true",
+                capability_bindings="""
+                [capability_bindings.push-task-branch]
+                remote = "origin"
+                allowed_branch_prefixes = ["job/"]
+                protected_branch_prefixes = ["main", "master"]
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        future = subject.submit(
+            self._policy_v2_job(
+                job_id="push-priv-future-clock",
+                permission_profile="privileged",
+                capabilities=["push-task-branch"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["review-readonly"],
+                owner_approval={
+                    "approved_by": "1" * 64,
+                    "approval_ref": "oa-event-future-clock",
+                    "approved_at": (
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+                    ).isoformat(),
+                    "summary": (
+                        "capability=push-task-branch;repo=repo1;"
+                        "job=push-priv-future-clock;attempt=1;branch=job/push-priv-future-clock"
+                    ),
+                },
+            )
+        )
+        self.assertEqual(future["status"], "REJECTED")
+        self.assertEqual(future["error"]["code"], "invalid_owner_approval")
         subject.close()
 
     def test_legacy_write_with_empty_allowed_paths_maps_to_full_worktree(self) -> None:
