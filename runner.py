@@ -455,6 +455,7 @@ class VerificationRun:
 
 @dataclasses.dataclass
 class RunnerConfig:
+    config_path: Path
     app_dir: Path
     state_dir: Path
     db_path: Path
@@ -483,6 +484,7 @@ class RunnerConfig:
 
     @classmethod
     def load(cls, config_path: Path) -> "RunnerConfig":
+        config_path = config_path.expanduser().resolve()
         data = tomllib.loads(config_path.read_text(encoding="utf-8"))
         app_dir = config_path.parent
         runner_cfg = data["runner"]
@@ -630,6 +632,7 @@ class RunnerConfig:
             if owner_pubkey == "0" * 64 or not re.fullmatch(r"[0-9a-f]{64}", owner_pubkey):
                 raise RunnerError("invalid_config", "runner.owner_pubkey must be a real 64-hex owner pubkey")
         return cls(
+            config_path=config_path,
             app_dir=app_dir,
             state_dir=Path(runner_cfg["state_dir"]).expanduser(),
             db_path=Path(runner_cfg["db_path"]).expanduser(),
@@ -2250,9 +2253,11 @@ class TestSandbox:
             self.home_dir,
         ]
         read_roots.extend(self._git_metadata_read_roots())
+        darwin_temp = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
+        developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
+        if sys.platform == "darwin":
+            read_roots.append(developer_tools_cache)
         if self.xcode_derived_data is not None:
-            darwin_temp = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
-            developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
             read_roots.extend(
                 [
                     self.xcode_derived_data,
@@ -2303,6 +2308,8 @@ class TestSandbox:
             ).strip()
         read_rules = " ".join(f"(subpath {json.dumps(str(path))})" for path in read_roots)
         write_roots = [self.worktree, self.home_dir, Path("/private/tmp")]
+        if sys.platform == "darwin":
+            write_roots.append(developer_tools_cache)
         if self.xcode_derived_data is not None:
             write_roots.extend(
                 [
@@ -2924,6 +2931,7 @@ class Runner:
                 return self._execute_sync(job)
             if self._is_operational_job(job["payload"]):
                 return self._execute_capability(job)
+            config_sha256_before = self._config_sha256()
             deadline = Deadline(job["payload"]["deadline_seconds"])
             lease = utc_now() + min(self.config.active_lease_seconds, job["payload"]["deadline_seconds"])
             repo = self.worktrees.repo(job["payload"]["repo_id"])
@@ -2958,7 +2966,14 @@ class Runner:
                 self._assert_not_cancelled(job["job_id"], job["attempt"])
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"RUNNING"}, "VERIFYING", lease_expires=lease)
                 tests = self._run_tests(job, worktree, deadline)
+                tests = self._with_config_immutability(tests, config_sha256_before)
                 artifacts["tests"] = self._write_artifact(job, "tests", tests)
+                if not tests["config_immutability"]["unchanged"]:
+                    raise RunnerError(
+                        "config_changed_during_execution",
+                        "Runner configuration changed during job execution",
+                        details=tests["config_immutability"],
+                    )
                 if tests.get("exit_code"):
                     failing = next((item for item in tests.get("profiles", []) if item.get("exit_code")), None)
                     raise RunnerError(
@@ -2972,6 +2987,14 @@ class Runner:
                 result["artifacts"] = dict(sorted(artifacts.items()))
                 self.result_validator.validate(result)
                 self._write_artifact(job, "result", result)
+                tests = self._with_config_immutability(tests, config_sha256_before)
+                artifacts["tests"] = self._write_artifact(job, "tests", tests)
+                if not tests["config_immutability"]["unchanged"]:
+                    raise RunnerError(
+                        "config_changed_during_execution",
+                        "Runner configuration changed during job execution",
+                        details=tests["config_immutability"],
+                    )
                 acceptance = self.supervisor.accept(job, worker_result, tests, deadline)
                 artifacts["acceptance"] = self._write_artifact(job, "acceptance", acceptance)
                 result["supervisor"]["acceptance"] = acceptance
@@ -2995,7 +3018,7 @@ class Runner:
                 if (
                     current
                     and current["status"] == "VERIFYING"
-                    and exc.code != "verification_artifact_invalid"
+                    and exc.code not in {"verification_artifact_invalid", "config_changed_during_execution"}
                     and self._has_verification_artifacts(current)
                 ):
                     retry_delay = min(30, self.config.active_lease_seconds)
@@ -3453,6 +3476,25 @@ class Runner:
         worker_result = self._read_artifact(job, "worker-result")
         tests = self._read_artifact(job, "tests")
         result = self._read_artifact(job, "result")
+        config_immutability = tests.get("config_immutability", {})
+        config_sha256_before = config_immutability.get("sha256_before")
+        if isinstance(config_sha256_before, str):
+            tests = self._with_config_immutability(tests, config_sha256_before)
+            self._write_artifact(job, "tests", tests)
+            if not tests["config_immutability"]["unchanged"]:
+                error = RunnerError(
+                    "config_changed_during_execution",
+                    "Runner configuration changed during job execution",
+                    details=tests["config_immutability"],
+                )
+                return self.ledger.transition(
+                    job["job_id"],
+                    job["attempt"],
+                    {"VERIFYING"},
+                    "FAILED",
+                    error=error.as_dict(),
+                    result=result,
+                )
         try:
             self.supervisor.decision_validator.validate(route)
             self.supervisor.worker_validator.validate({"findings": worker_result.get("findings")})
@@ -3478,6 +3520,22 @@ class Runner:
                 result=result,
             )
         return self.ledger.transition(job["job_id"], job["attempt"], {"VERIFYING"}, "DONE", result=result)
+
+    def _config_sha256(self) -> str:
+        try:
+            return sha256_hex(self.config.config_path.read_bytes())
+        except OSError as exc:
+            raise RunnerError("config_unreadable", "Runner configuration could not be hashed") from exc
+
+    def _with_config_immutability(self, tests: dict[str, Any], sha256_before: str) -> dict[str, Any]:
+        sha256_after = self._config_sha256()
+        materialized = dict(tests)
+        materialized["config_immutability"] = {
+            "sha256_before": sha256_before,
+            "sha256_after": sha256_after,
+            "unchanged": sha256_before == sha256_after,
+        }
+        return materialized
 
     def _select_job(self, job_id: str | None, attempt: int | None) -> dict[str, Any]:
         if job_id is not None and attempt is not None:

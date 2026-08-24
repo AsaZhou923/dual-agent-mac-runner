@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import http.server
 import json
 import os
@@ -1898,6 +1899,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                     check=False,
                 )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("xcrun_db", result.stderr)
         finally:
             self._run(
                 "git",
@@ -1910,6 +1912,70 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                 check=False,
             )
             self._run("git", "-C", str(self.repo), "worktree", "prune", check=False)
+
+    def test_test_sandbox_grants_only_developer_tools_cache_on_macos(self) -> None:
+        darwin_temp = self.root / "darwin" / "T" / "session"
+        darwin_temp.mkdir(parents=True)
+        expected_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
+        with mock.patch.object(runner.sys, "platform", "darwin"), mock.patch.dict(
+            os.environ,
+            {"TMPDIR": f"{darwin_temp}/"},
+        ):
+            with runner.TestSandbox(self.root / "state-darwin-cache", self.repo) as sandbox:
+                profile = sandbox.profile_path.read_text(encoding="utf-8")
+        self.assertIn(f"(subpath {json.dumps(str(expected_cache.resolve()))})", profile)
+        self.assertNotIn(f"(subpath {json.dumps(str(expected_cache.parent.resolve()))})", profile)
+
+    def test_execute_records_config_immutability_evidence(self) -> None:
+        subject = self._runner()
+        before = subject._config_sha256()
+        tests = subject._with_config_immutability({"exit_code": 0}, before)
+        evidence = tests["config_immutability"]
+        expected_hash = hashlib.sha256(self.config.config_path.read_bytes()).hexdigest()
+        self.assertEqual(evidence["sha256_before"], expected_hash)
+        self.assertEqual(evidence["sha256_after"], expected_hash)
+        self.assertTrue(evidence["unchanged"])
+        self.config.config_path.write_text(
+            self.config.config_path.read_text(encoding="utf-8") + "\n# changed during test\n",
+            encoding="utf-8",
+        )
+        changed = subject._with_config_immutability({"exit_code": 0}, before)["config_immutability"]
+        self.assertNotEqual(changed["sha256_after"], expected_hash)
+        self.assertFalse(changed["unchanged"])
+        subject.close()
+
+    def test_config_change_after_result_creation_is_terminal(self) -> None:
+        subject = self._runner()
+        subject.submit(self.sample_job)
+        original_config = self.config.config_path.read_text(encoding="utf-8")
+        original_finalize = subject._finalize
+
+        def mutate_after_finalize(*args: object, **kwargs: object) -> dict[str, object]:
+            result = original_finalize(*args, **kwargs)
+            self.config.config_path.write_text(original_config + "\n# changed after result\n", encoding="utf-8")
+            return result
+
+        with (
+            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
+            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
+            mock.patch.object(
+                subject,
+                "_run_tests",
+                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
+            ),
+            mock.patch.object(subject, "_finalize", side_effect=mutate_after_finalize),
+            mock.patch.object(subject.supervisor, "accept") as accept,
+        ):
+            failed = subject.execute("agent-20260821-0042", 1)
+
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "config_changed_during_execution")
+        accept.assert_not_called()
+        tests = json.loads(subject._artifact_path(failed, "tests").read_text(encoding="utf-8"))
+        self.assertFalse(tests["config_immutability"]["unchanged"])
+        self.config.config_path.write_text(original_config, encoding="utf-8")
+        self.assertEqual(subject.execute("agent-20260821-0042", 1)["status"], "FAILED")
+        subject.close()
 
     def test_test_sandbox_resolves_linked_worktree_git_metadata_roots(self) -> None:
         worktree = self.root / "metadata-worktree"
