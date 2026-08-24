@@ -43,6 +43,11 @@ return the stored attempt without adding another job or event.
 
 - Leave every operational capability disabled until its repository, remote,
   branch prefix, fixed tool, or service binding is explicit in external config.
+- `prepare-registered-repo` is network-free and requires an immutable external
+  config snapshot: exact untracked-status SHA-256/count, allowed pre-repair
+  remote URLs, canonical remote, and an external backup root. It moves only
+  contained regular untracked files, writes and verifies a size/SHA-256
+  manifest, repairs only the fixed remote URL, and rolls back on failure.
 - `sync-registered-repo` requires the reserved `git-sync-verify` profile and a
   clean registered checkout on the configured branch and canonical remote.
 - Keep `permission_mode=default`. Do not enable `bypassPermissions` until the

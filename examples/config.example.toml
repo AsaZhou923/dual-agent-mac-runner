@@ -28,6 +28,7 @@ allow_write_tasks = false
 [capabilities]
 image_generation = false
 git = false
+prepare-registered-repo = false
 sync-registered-repo = false
 push-task-branch = false
 manage-pr = false
@@ -49,6 +50,11 @@ sync_enabled = false
 # canonical_remote_url = "https://github.com/owner/repo.git"
 # sync_remote = "origin"
 # sync_branch = "main"
+# prepare_enabled = false
+# prepare_backup_root = "/Users/name/Project_Code/repo-untracked-backups"
+# prepare_expected_status_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# prepare_expected_untracked_count = 1
+# prepare_allowed_remote_urls = ["https://github.com/owner/repo.git"]
 
 # Privileged jobs are fail-closed unless runner.owner_pubkey is the real owner
 # pubkey and owner_approval exactly matches the deterministic action summary.

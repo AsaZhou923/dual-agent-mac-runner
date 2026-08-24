@@ -244,6 +244,7 @@ class RunnerTests(unittest.TestCase):
         owner_pubkey: str = "",
         extra_capabilities: str = "",
         capability_bindings: str = "",
+        repo_prepare_config: str = "",
         sensitive_paths: str = '[".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials/*", "secrets/*"]',
     ) -> Path:
         config_path = self.app_dir / "config.toml"
@@ -290,6 +291,7 @@ class RunnerTests(unittest.TestCase):
             canonical_remote_url = "{self.origin}"
             sync_remote = "origin"
             sync_branch = "main"
+            {repo_prepare_config}
             """
         ).strip()
         if capability_bindings:
@@ -705,6 +707,210 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(stored["wire_payload"]["scope"]["paths"], [])
         self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.target_sha)
         subject.close()
+
+    def test_policy_v2_prepare_registered_repo_backs_up_untracked_files_and_repairs_remote(self) -> None:
+        self._prepare_sync_repo()
+        first = self.repo / "notes" / "first.txt"
+        first.parent.mkdir()
+        first.write_text("first\n", encoding="utf-8")
+        second = self.repo / "second.txt"
+        second.write_text("second\n", encoding="utf-8")
+        previous_remote = self.root / "old-origin.git"
+        self._run("git", "-C", str(self.repo), "remote", "set-url", "origin", str(previous_remote))
+        status_text = self._run(
+            "git",
+            "-C",
+            str(self.repo),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ).stdout
+        backup_root = self.root / "prep-backups"
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="prepare-registered-repo = true",
+                repo_prepare_config=textwrap.dedent(
+                    f"""
+                    prepare_enabled = true
+                    prepare_backup_root = "{backup_root}"
+                    prepare_expected_status_sha256 = "{runner.sha256_hex(status_text.encode('utf-8'))}"
+                    prepare_expected_untracked_count = 2
+                    prepare_allowed_remote_urls = ["{previous_remote}", "{self.origin}"]
+                    """
+                ).strip(),
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="prepare-v2",
+            base_sha=self.base_sha,
+            target_sha=self.base_sha,
+            task_type="prepare",
+            permission_profile="operational",
+            capabilities=["prepare-registered-repo"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "none"},
+            verification_profiles=["review-readonly"],
+            execution_route="auto",
+            preferred_worker="codex",
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        with mock.patch.object(
+            subject,
+            "_run_capability_verification",
+            return_value={"profile": "review-readonly", "exit_code": 0},
+        ):
+            result = subject.execute("prepare-v2", 1)
+        self.assertEqual(result["status"], "DONE", result)
+        self.assertEqual(self._git(self.repo, "status", "--porcelain=v1", "--untracked-files=all"), "")
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        backup = backup_root / "prepare-v2-attempt-1"
+        self.assertEqual((backup / "notes" / "first.txt").read_text(encoding="utf-8"), "first\n")
+        self.assertEqual((backup / "second.txt").read_text(encoding="utf-8"), "second\n")
+        self.assertTrue((backup / "manifest.json").is_file())
+        self.assertEqual(self._git(self.repo, "remote", "get-url", "origin"), str(self.origin))
+        subject.close()
+
+    def test_prepare_registered_repo_status_mismatch_fails_without_mutation(self) -> None:
+        self._prepare_sync_repo()
+        untracked = self.repo / "keep.txt"
+        untracked.write_text("keep\n", encoding="utf-8")
+        backup_root = self.root / "prep-backups-mismatch"
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="prepare-registered-repo = true",
+                repo_prepare_config=textwrap.dedent(
+                    f"""
+                    prepare_enabled = true
+                    prepare_backup_root = "{backup_root}"
+                    prepare_expected_status_sha256 = "{'0' * 64}"
+                    prepare_expected_untracked_count = 1
+                    prepare_allowed_remote_urls = ["{self.origin}"]
+                    """
+                ).strip(),
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="prepare-mismatch",
+            base_sha=self.base_sha,
+            target_sha=self.base_sha,
+            task_type="prepare",
+            permission_profile="operational",
+            capabilities=["prepare-registered-repo"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "none"},
+            verification_profiles=["review-readonly"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        with mock.patch.object(
+            subject,
+            "_run_capability_verification",
+            return_value={"profile": "review-readonly", "exit_code": 0},
+        ):
+            result = subject.execute("prepare-mismatch", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "prep_status_mismatch", result)
+        self.assertEqual(untracked.read_text(encoding="utf-8"), "keep\n")
+        self.assertFalse(backup_root.exists())
+        self.assertEqual(self._git(self.repo, "remote", "get-url", "origin"), str(self.origin))
+        subject.close()
+
+    def test_prepare_registered_repo_move_failure_restores_exact_status(self) -> None:
+        self._prepare_sync_repo()
+        first = self.repo / "first.txt"
+        second = self.repo / "second.txt"
+        first.write_text("first\n", encoding="utf-8")
+        second.write_text("second\n", encoding="utf-8")
+        status_text = self._run(
+            "git",
+            "-C",
+            str(self.repo),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ).stdout
+        backup_root = self.root / "prep-backups-rollback"
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="prepare-registered-repo = true",
+                repo_prepare_config=textwrap.dedent(
+                    f"""
+                    prepare_enabled = true
+                    prepare_backup_root = "{backup_root}"
+                    prepare_expected_status_sha256 = "{runner.sha256_hex(status_text.encode('utf-8'))}"
+                    prepare_expected_untracked_count = 2
+                    prepare_allowed_remote_urls = ["{self.origin}"]
+                    """
+                ).strip(),
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="prepare-rollback",
+            base_sha=self.base_sha,
+            target_sha=self.base_sha,
+            task_type="prepare",
+            permission_profile="operational",
+            capabilities=["prepare-registered-repo"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "none"},
+            verification_profiles=["review-readonly"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        original_move = runner.shutil.move
+        injected = False
+
+        def fail_second_backup(source: str, destination: str) -> object:
+            nonlocal injected
+            if not injected and source.endswith("second.txt") and str(backup_root) in destination:
+                injected = True
+                raise OSError("injected move failure")
+            return original_move(source, destination)
+
+        with (
+            mock.patch.object(
+                subject,
+                "_run_capability_verification",
+                return_value={"profile": "review-readonly", "exit_code": 0},
+            ),
+            mock.patch.object(runner.shutil, "move", side_effect=fail_second_backup),
+        ):
+            result = subject.execute("prepare-rollback", 1)
+        self.assertEqual(result["status"], "FAILED", result)
+        self.assertEqual(result["error"]["code"], "prep_failed", result)
+        self.assertEqual(first.read_text(encoding="utf-8"), "first\n")
+        self.assertEqual(second.read_text(encoding="utf-8"), "second\n")
+        restored = self._run(
+            "git",
+            "-C",
+            str(self.repo),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ).stdout
+        self.assertEqual(runner.sha256_hex(restored.encode("utf-8")), runner.sha256_hex(status_text.encode("utf-8")))
+        self.assertFalse((backup_root / "prepare-rollback-attempt-1").exists())
+        subject.close()
+
+    def test_prepare_backup_root_inside_checkout_is_rejected(self) -> None:
+        with self.assertRaises(runner.RunnerError) as error:
+            runner.RunnerConfig.load(
+                self._write_config(
+                    extra_capabilities="prepare-registered-repo = true",
+                    repo_prepare_config=textwrap.dedent(
+                        f"""
+                        prepare_enabled = true
+                        prepare_backup_root = "{self.repo / 'unsafe-backup'}"
+                        prepare_expected_status_sha256 = "{'0' * 64}"
+                        prepare_expected_untracked_count = 1
+                        prepare_allowed_remote_urls = ["{self.origin}"]
+                        """
+                    ).strip(),
+                )
+            )
+        self.assertEqual(error.exception.code, "invalid_config")
 
     def test_policy_v2_dry_run_rejects_unknown_top_level_field(self) -> None:
         subject = self._runner()
@@ -1460,6 +1666,34 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(result["status"], "FAILED")
         self.assertEqual(result["error"]["code"], "path_escape")
         subject.close()
+
+    def test_ornith_tool_executor_normalizes_absolute_paths_inside_worktree(self) -> None:
+        executor = runner.OrnithToolExecutor(self.repo, runner.Deadline(30), 4096)
+        results = executor.execute(
+            [
+                {
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": str(self.repo / "README.md"), "max_chars": 200},
+                    }
+                }
+            ]
+        )
+        content = json.loads(results[0]["content"])
+        self.assertEqual(content["path"], "README.md")
+
+        with self.assertRaises(runner.RunnerError) as error:
+            executor.execute(
+                [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": str(self.real_home / ".ssh" / "secret.txt")},
+                        }
+                    }
+                ]
+            )
+        self.assertEqual(error.exception.code, "path_escape")
 
     def test_codex_write_route_edits_before_tests_and_commits_without_push(self) -> None:
         verify_code = "from pathlib import Path; p=Path('allowed.txt'); raise SystemExit(0 if p.read_text(encoding='utf-8').strip() == 'changed by fake codex' else 9)"

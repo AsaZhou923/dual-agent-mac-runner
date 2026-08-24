@@ -62,6 +62,7 @@ PERMISSION_PROFILES = {"observe", "standard-worktree", "operational", "privilege
 SCOPE_ROOTS = {"metadata-only", "worktree", "registered-checkout"}
 NETWORK_MODES = {"none", "relay-only", "declared-remotes-and-registries"}
 OPERATIONAL_CAPABILITIES = {
+    "prepare-registered-repo",
     "sync-registered-repo",
     "push-task-branch",
     "manage-pr",
@@ -415,6 +416,11 @@ class RepoConfig:
     canonical_remote_url: str | None
     sync_remote: str | None
     sync_branch: str | None
+    prepare_enabled: bool = False
+    prepare_backup_root: Path | None = None
+    prepare_expected_status_sha256: str | None = None
+    prepare_expected_untracked_count: int | None = None
+    prepare_allowed_remote_urls: tuple[str, ...] = ()
     tool_registry: tuple[str, ...] = ()
     sensitive_paths: tuple[str, ...] = ()
 
@@ -493,6 +499,7 @@ class RunnerConfig:
             raise RunnerError("invalid_config", "capability_bindings must be a TOML table")
         repos: dict[str, RepoConfig] = {}
         for repo_id, entry in data.get("repos", {}).items():
+            repo_path = Path(entry["path"]).expanduser().resolve()
             sync_enabled = entry.get("sync_enabled", False)
             if not isinstance(sync_enabled, bool):
                 raise RunnerError("invalid_config", f"repos.{repo_id}.sync_enabled must be boolean")
@@ -515,15 +522,64 @@ class RunnerConfig:
                     assert isinstance(value, str)
                     if value.startswith("-") or ".." in value or not re.fullmatch(r"[A-Za-z0-9._/-]+", value):
                         raise RunnerError("invalid_config", f"repos.{repo_id}.{label} is not a safe fixed Git name")
+            prepare_enabled = entry.get("prepare_enabled", False)
+            if not isinstance(prepare_enabled, bool):
+                raise RunnerError("invalid_config", f"repos.{repo_id}.prepare_enabled must be boolean")
+            prepare_backup_root: Path | None = None
+            prepare_expected_status_sha256: str | None = None
+            prepare_expected_untracked_count: int | None = None
+            prepare_allowed_remote_urls: tuple[str, ...] = ()
+            if prepare_enabled:
+                if not sync_enabled:
+                    raise RunnerError("invalid_config", f"repos.{repo_id} prepare requires sync_enabled=true")
+                raw_backup_root = entry.get("prepare_backup_root")
+                if not isinstance(raw_backup_root, str) or not raw_backup_root.strip():
+                    raise RunnerError("invalid_config", f"repos.{repo_id}.prepare_backup_root is required")
+                prepare_backup_root = Path(raw_backup_root).expanduser().resolve()
+                if prepare_backup_root == repo_path or repo_path in prepare_backup_root.parents:
+                    raise RunnerError("invalid_config", f"repos.{repo_id}.prepare_backup_root must be outside the checkout")
+                raw_status_sha = entry.get("prepare_expected_status_sha256")
+                if not isinstance(raw_status_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", raw_status_sha):
+                    raise RunnerError(
+                        "invalid_config",
+                        f"repos.{repo_id}.prepare_expected_status_sha256 must be lowercase SHA-256",
+                    )
+                prepare_expected_status_sha256 = raw_status_sha
+                raw_count = entry.get("prepare_expected_untracked_count")
+                if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 1:
+                    raise RunnerError(
+                        "invalid_config",
+                        f"repos.{repo_id}.prepare_expected_untracked_count must be a positive integer",
+                    )
+                prepare_expected_untracked_count = raw_count
+                raw_urls = entry.get("prepare_allowed_remote_urls")
+                if not isinstance(raw_urls, list) or not raw_urls or not all(
+                    isinstance(item, str) and item for item in raw_urls
+                ):
+                    raise RunnerError(
+                        "invalid_config",
+                        f"repos.{repo_id}.prepare_allowed_remote_urls must be a non-empty string array",
+                    )
+                prepare_allowed_remote_urls = tuple(raw_urls)
+                if canonical_remote_url not in prepare_allowed_remote_urls:
+                    raise RunnerError(
+                        "invalid_config",
+                        f"repos.{repo_id}.prepare_allowed_remote_urls must include canonical_remote_url",
+                    )
             repos[repo_id] = RepoConfig(
                 repo_id=repo_id,
-                path=Path(entry["path"]).expanduser().resolve(),
+                path=repo_path,
                 fetch_remote=entry.get("fetch_remote"),
                 test_profiles=tuple(entry.get("test_profiles", [])),
                 sync_enabled=sync_enabled,
                 canonical_remote_url=canonical_remote_url if isinstance(canonical_remote_url, str) else None,
                 sync_remote=sync_remote if isinstance(sync_remote, str) else None,
                 sync_branch=sync_branch if isinstance(sync_branch, str) else None,
+                prepare_enabled=prepare_enabled,
+                prepare_backup_root=prepare_backup_root,
+                prepare_expected_status_sha256=prepare_expected_status_sha256,
+                prepare_expected_untracked_count=prepare_expected_untracked_count,
+                prepare_allowed_remote_urls=prepare_allowed_remote_urls,
                 tool_registry=tuple(str(item) for item in entry.get("tool_registry", [])),
                 sensitive_paths=tuple(cls._validate_sensitive_patterns(repo_id, entry.get("sensitive_paths", []))),
             )
@@ -1289,6 +1345,262 @@ class GitSyncManager:
         if not repo.canonical_remote_url or not repo.sync_remote or not repo.sync_branch:
             raise RunnerError("sync_config_incomplete", f"Repository {repo.repo_id} has incomplete synchronization config")
 
+    def assert_prepare_configured(self, repo: RepoConfig) -> None:
+        self.assert_configured(repo)
+        if not repo.prepare_enabled:
+            raise RunnerError("prepare_not_allowed", f"Repository {repo.repo_id} is not enabled for preparation")
+        if (
+            repo.prepare_backup_root is None
+            or repo.prepare_expected_status_sha256 is None
+            or repo.prepare_expected_untracked_count is None
+            or not repo.prepare_allowed_remote_urls
+        ):
+            raise RunnerError("prepare_config_incomplete", f"Repository {repo.repo_id} has incomplete preparation config")
+
+    def prepare_registered_checkout(
+        self,
+        repo: RepoConfig,
+        payload: dict[str, Any],
+        deadline: Deadline,
+    ) -> dict[str, Any]:
+        self.assert_prepare_configured(repo)
+        assert repo.prepare_backup_root is not None
+        assert repo.prepare_expected_status_sha256 is not None
+        assert repo.prepare_expected_untracked_count is not None
+        assert repo.canonical_remote_url is not None
+        assert repo.sync_remote is not None
+        assert repo.sync_branch is not None
+
+        with self.lock(repo):
+            inside = self._git(repo, ["rev-parse", "--is-inside-work-tree"], deadline, check=False)
+            if inside.returncode != 0 or inside.stdout.strip() != "true":
+                raise RunnerError("not_git_checkout", f"Configured path for {repo.repo_id} is not a Git worktree")
+            top = Path(self._git(repo, ["rev-parse", "--show-toplevel"], deadline).stdout.strip()).resolve()
+            if top != repo.path:
+                raise RunnerError("wrong_checkout", f"Configured path for {repo.repo_id} is not the worktree top level")
+            branch = self._git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], deadline, check=False)
+            if branch.returncode != 0 or branch.stdout.strip() != repo.sync_branch:
+                raise RunnerError(
+                    "wrong_branch",
+                    f"Repository {repo.repo_id} is not on its configured preparation branch",
+                    details={"expected": repo.sync_branch},
+                )
+            head = self._rev_parse(repo, "HEAD", deadline)
+            if head != payload["base_sha"] or payload["target_sha"] != payload["base_sha"]:
+                raise RunnerError(
+                    "base_mismatch",
+                    f"Repository {repo.repo_id} preparation requires target_sha=base_sha=current HEAD",
+                    details={"expected": payload["base_sha"], "actual": head},
+                )
+            remote_urls = self._git(
+                repo,
+                ["remote", "get-url", "--all", repo.sync_remote],
+                deadline,
+                check=False,
+            )
+            urls = [line for line in remote_urls.stdout.splitlines() if line]
+            if remote_urls.returncode != 0 or len(urls) != 1 or urls[0] not in repo.prepare_allowed_remote_urls:
+                raise RunnerError(
+                    "wrong_remote",
+                    f"Configured remote for {repo.repo_id} is outside the preparation allowlist",
+                    details={"allowed": list(repo.prepare_allowed_remote_urls)},
+                )
+            original_remote = urls[0]
+
+            status = self._git(repo, ["status", "--porcelain=v1", "--untracked-files=all"], deadline)
+            status_text = status.stdout
+            status_hash = sha256_hex(status_text.encode("utf-8"))
+            status_lines = status_text.splitlines()
+            if status_hash != repo.prepare_expected_status_sha256:
+                raise RunnerError(
+                    "prep_status_mismatch",
+                    "Repository status does not match the configured immutable preparation snapshot",
+                    details={"expected": repo.prepare_expected_status_sha256, "actual": status_hash},
+                )
+            if len(status_lines) != repo.prepare_expected_untracked_count:
+                raise RunnerError(
+                    "prep_status_mismatch",
+                    "Repository untracked count does not match the configured preparation snapshot",
+                    details={"expected": repo.prepare_expected_untracked_count, "actual": len(status_lines)},
+                )
+            if any(not line.startswith("?? ") for line in status_lines):
+                raise RunnerError("prep_tracked_changes", "Preparation refuses staged or tracked changes")
+            ignored = self._git(
+                repo,
+                ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+                deadline,
+            )
+            ignored_paths = [path for path in ignored.stdout.split("\0") if path]
+            if ignored_paths:
+                raise RunnerError(
+                    "prep_ignored_files",
+                    "Preparation refuses ignored files that are absent from the immutable backup snapshot",
+                    details={"entry_count": len(ignored_paths)},
+                )
+
+            status_z = self._git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], deadline)
+            records = [record for record in status_z.stdout.split("\0") if record]
+            if len(records) != repo.prepare_expected_untracked_count or any(
+                not record.startswith("?? ") for record in records
+            ):
+                raise RunnerError("prep_status_mismatch", "NUL-delimited status does not match the preparation snapshot")
+
+            sources: list[tuple[str, Path]] = []
+            manifest_entries: list[dict[str, Any]] = []
+            for record in records:
+                relative = record[3:]
+                if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                    raise RunnerError("path_escape", f"Preparation path is not repository-relative: {relative}")
+                unresolved = repo.path / relative
+                if unresolved.is_symlink():
+                    raise RunnerError("prep_special_file", f"Preparation refuses symlink: {relative}")
+                source = unresolved.resolve()
+                if repo.path not in source.parents or not source.is_file():
+                    raise RunnerError("prep_special_file", f"Preparation accepts only contained regular files: {relative}")
+                digest = hashlib.sha256()
+                try:
+                    with source.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    source_size = source.stat().st_size
+                except OSError as exc:
+                    raise RunnerError("prep_file_unreadable", f"Preparation cannot read: {relative}") from exc
+                sources.append((relative, source))
+                manifest_entries.append(
+                    {"path": relative, "size": source_size, "sha256": digest.hexdigest()}
+                )
+            manifest_entries.sort(key=lambda item: item["path"])
+            sources.sort(key=lambda item: item[0])
+            manifest_data = canonical_json_bytes({"schema": "mac-runner/prep-manifest-v1", "files": manifest_entries})
+            manifest_hash = sha256_hex(manifest_data)
+            total_bytes = sum(int(item["size"]) for item in manifest_entries)
+
+            backup_root = repo.prepare_backup_root.resolve()
+            backup_dir = (backup_root / f"{payload['job_id']}-attempt-{payload['attempt']}").resolve()
+            if backup_dir.parent != backup_root or backup_dir.exists():
+                raise RunnerError("prep_backup_exists", "Preparation backup directory already exists or escaped its root")
+
+            moved: list[tuple[Path, Path]] = []
+            remote_changed = False
+            try:
+                backup_dir.mkdir(parents=True, exist_ok=False)
+                (backup_dir / "manifest.json").write_bytes(manifest_data + b"\n")
+                for relative, source in sources:
+                    destination = (backup_dir / relative).resolve()
+                    if backup_dir not in destination.parents or destination.exists():
+                        raise RunnerError("prep_backup_collision", f"Backup destination is unsafe: {relative}")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    moved.append((source, destination))
+                    shutil.move(str(source), str(destination))
+
+                for entry in manifest_entries:
+                    destination = (backup_dir / str(entry["path"])).resolve()
+                    if not destination.is_file() or destination.stat().st_size != entry["size"]:
+                        raise RunnerError("prep_backup_verify_failed", f"Backup size mismatch: {entry['path']}")
+                    digest = hashlib.sha256()
+                    with destination.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if digest.hexdigest() != entry["sha256"]:
+                        raise RunnerError("prep_backup_verify_failed", f"Backup hash mismatch: {entry['path']}")
+
+                after_move = self._git(repo, ["status", "--porcelain=v1", "--untracked-files=all"], deadline)
+                if after_move.stdout:
+                    raise RunnerError("prep_checkout_not_clean", "Checkout is not clean after verified backup")
+
+                if original_remote != repo.canonical_remote_url:
+                    self._git(
+                        repo,
+                        ["remote", "set-url", repo.sync_remote, repo.canonical_remote_url],
+                        deadline,
+                    )
+                    remote_changed = True
+                final_urls = self._git(
+                    repo,
+                    ["remote", "get-url", "--all", repo.sync_remote],
+                    deadline,
+                )
+                if [line for line in final_urls.stdout.splitlines() if line] != [repo.canonical_remote_url]:
+                    raise RunnerError("prep_remote_verify_failed", "Canonical remote repair did not verify exactly")
+                if self._rev_parse(repo, "HEAD", deadline) != head:
+                    raise RunnerError("prep_head_changed", "Preparation unexpectedly changed HEAD")
+                return {
+                    "repo_id": repo.repo_id,
+                    "branch": repo.sync_branch,
+                    "head": head,
+                    "backup_path": str(backup_dir),
+                    "file_count": len(manifest_entries),
+                    "total_bytes": total_bytes,
+                    "manifest_sha256": manifest_hash,
+                    "status_sha256_before": status_hash,
+                    "status_sha256_after": sha256_hex(b""),
+                    "remote_before": original_remote,
+                    "remote_after": repo.canonical_remote_url,
+                }
+            except (OSError, RunnerError) as exc:
+                rollback_errors: list[str] = []
+                if remote_changed:
+                    try:
+                        self._git(repo, ["remote", "set-url", repo.sync_remote, original_remote], deadline)
+                        restored_remote = self._git(
+                            repo,
+                            ["remote", "get-url", "--all", repo.sync_remote],
+                            deadline,
+                        )
+                        if [line for line in restored_remote.stdout.splitlines() if line] != [original_remote]:
+                            rollback_errors.append("remote URL did not restore")
+                    except Exception as rollback_exc:  # pragma: no cover - catastrophic host failure
+                        rollback_errors.append(f"remote: {type(rollback_exc).__name__}")
+                for source, destination in reversed(moved):
+                    try:
+                        if source.exists() and not destination.exists():
+                            continue
+                        if source.exists() or not destination.exists():
+                            raise OSError(f"rollback collision or missing backup for {source}")
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(destination), str(source))
+                    except OSError as rollback_exc:
+                        rollback_errors.append(f"file:{source.relative_to(repo.path)}:{rollback_exc}")
+                if not rollback_errors and backup_dir.exists():
+                    try:
+                        shutil.rmtree(backup_dir)
+                    except OSError as rollback_exc:
+                        rollback_errors.append(f"backup cleanup: {rollback_exc}")
+                try:
+                    restored = self._git(
+                        repo,
+                        ["status", "--porcelain=v1", "--untracked-files=all"],
+                        deadline,
+                        check=False,
+                    )
+                    if sha256_hex(restored.stdout.encode("utf-8")) != status_hash:
+                        rollback_errors.append("status hash did not restore")
+                except RunnerError as rollback_exc:
+                    rollback_errors.append(f"status verification: {rollback_exc.code}")
+                for entry in manifest_entries:
+                    restored_source = (repo.path / str(entry["path"])).resolve()
+                    try:
+                        digest = hashlib.sha256()
+                        with restored_source.open("rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        if (
+                            restored_source.stat().st_size != entry["size"]
+                            or digest.hexdigest() != entry["sha256"]
+                        ):
+                            rollback_errors.append(f"content did not restore: {entry['path']}")
+                    except OSError as rollback_exc:
+                        rollback_errors.append(f"content verification:{entry['path']}:{rollback_exc}")
+                if rollback_errors:
+                    raise RunnerError(
+                        "prep_rollback_failed",
+                        "Preparation failed and rollback could not restore the exact preflight state",
+                        details={"errors": rollback_errors, "backup_path": str(backup_dir)},
+                    ) from exc
+                if isinstance(exc, RunnerError):
+                    raise
+                raise RunnerError("prep_failed", "Preparation failed before completion and was rolled back") from exc
+
     def preflight(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
         self.assert_configured(repo)
         snapshot = self._verify_checkout(repo, payload, deadline, allowed_heads={payload["base_sha"]})
@@ -1691,9 +2003,10 @@ class OrnithToolExecutor:
             raise RunnerError("ollama_invalid_tool_calls", "Tool path must be a string")
         if raw == ".":
             return self.worktree
-        if not raw or raw.startswith("/") or raw.startswith("~"):
+        if not raw or raw.startswith("~"):
             raise RunnerError("path_escape", f"Tool path must be relative: {raw}")
-        candidate = (self.worktree / raw).resolve()
+        supplied = Path(raw)
+        candidate = supplied.resolve() if supplied.is_absolute() else (self.worktree / supplied).resolve()
         if candidate != self.worktree.resolve() and self.worktree.resolve() not in candidate.parents:
             raise RunnerError("path_escape", f"Tool path escaped worktree: {raw}")
         return candidate
@@ -2387,8 +2700,8 @@ class Runner:
             self._require_capability_enabled(capability)
             if payload["required_capabilities"] and any(item in OPERATIONAL_CAPABILITIES for item in payload["required_capabilities"]):
                 raise RunnerError("capability_field_conflict", "required_capabilities may not be used as execution authorization")
-            if capability == "restart-user-service" and network["mode"] != "none":
-                raise RunnerError("network_not_allowed", "restart-user-service must use network.mode=none")
+            if capability in {"prepare-registered-repo", "restart-user-service"} and network["mode"] != "none":
+                raise RunnerError("network_not_allowed", f"{capability} must use network.mode=none")
             if capability in {"sync-registered-repo", "push-task-branch", "manage-pr", "install-user-tool"} and network["mode"] != "declared-remotes-and-registries":
                 raise RunnerError("network_not_allowed", f"{capability} requires network.mode=declared-remotes-and-registries")
             if permission_profile == "privileged":
@@ -2437,6 +2750,17 @@ class Runner:
                     raise RunnerError("sync_capability_required", "policy-v2 sync jobs must authorize sync-registered-repo")
             elif payload["required_capabilities"] != ["git"]:
                 raise RunnerError("sync_capability_required", "Sync jobs must require exactly the allowlisted git capability")
+            return
+        if payload.get("capabilities") == ["prepare-registered-repo"]:
+            self.sync.assert_prepare_configured(repo)
+            if payload["task_type"] != "prepare":
+                raise RunnerError("task_type_mismatch", "prepare-registered-repo requires task_type=prepare")
+            if payload["base_sha"] != payload["target_sha"]:
+                raise RunnerError("base_mismatch", "prepare-registered-repo requires target_sha=base_sha")
+            if self._effective_allowed_paths(payload) != ["."]:
+                raise RunnerError("prepare_scope_invalid", "Preparation must target only the registered repository root")
+            self.worktrees.assert_exact_commit(repo, payload["base_sha"], network_mode="none")
+            self.worktrees.assert_no_sensitive_paths(repo, payload["base_sha"], network_mode="none")
             return
         network_mode = payload.get("network", {}).get("mode", "none")
         self.worktrees.assert_exact_commit(repo, payload["base_sha"], network_mode=network_mode)
@@ -2506,6 +2830,12 @@ class Runner:
                     "remote_url": repo.canonical_remote_url if repo.sync_enabled else None,
                     "remote": repo.sync_remote if repo.sync_enabled else None,
                     "branch": repo.sync_branch if repo.sync_enabled else None,
+                },
+                "prepare": {
+                    "enabled": repo.prepare_enabled,
+                    "backup_root": str(repo.prepare_backup_root) if repo.prepare_backup_root else None,
+                    "expected_status_sha256": repo.prepare_expected_status_sha256,
+                    "expected_untracked_count": repo.prepare_expected_untracked_count,
                 },
             }
             for repo_id, repo in sorted(self.config.repos.items())
@@ -2861,6 +3191,19 @@ class Runner:
             self.worktrees.cleanup(repo, worktree)
 
     def _dispatch_capability(self, capability: str, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        if capability == "prepare-registered-repo":
+            outcome = self.sync.prepare_registered_checkout(repo, payload, deadline)
+            return {
+                "finding": {
+                    "severity": "info",
+                    "title": "Registered repository prepared",
+                    "detail": (
+                        f"Backed up {outcome['file_count']} untracked files for {repo.repo_id}, "
+                        "verified the manifest, and repaired only the configured canonical remote."
+                    ),
+                },
+                "result": outcome,
+            }
         if capability == "push-task-branch":
             return self._capability_push_task_branch(repo, payload, deadline)
         if capability == "manage-pr":
@@ -3142,6 +3485,7 @@ class Runner:
             You are a readonly code reviewer.
             Return JSON only with a top-level findings array.
             Use the provided tools when needed.
+            Every tool path argument must be repository-relative. Use "." for the repository root and never send an absolute path.
             Task type: {payload['task_type']}
             Focus: {', '.join(payload['focus'])}
             """

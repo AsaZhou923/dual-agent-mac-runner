@@ -51,6 +51,7 @@
         "review",
         "analyze",
         "fix",
+        "prepare",
         "test",
         "sync"
       ]
@@ -101,6 +102,7 @@
       "items": {
         "type": "string",
         "enum": [
+          "prepare-registered-repo",
           "sync-registered-repo",
           "push-task-branch",
           "manage-pr",

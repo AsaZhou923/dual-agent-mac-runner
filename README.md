@@ -31,9 +31,12 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
 - Temporary HOME plus a no-network Seatbelt profile for tests.
 - Worktree writes are limited by scope, changed-file count, diff size, and
   configured sensitive-path patterns.
-- Operational actions use fixed capability handlers for registered-repository
-  sync, task-branch push, PR management, fixed user-tool installation, and
-  configured user-service restart.
+- Operational actions use fixed capability handlers for reversible
+  registered-repository preparation, registered-repository sync, task-branch
+  push, PR management, fixed user-tool installation, and configured
+  user-service restart.
+- Ornith tool paths are normalized only when they resolve inside the fixed task
+  worktree; outside paths and symlink escapes remain fail-closed.
 - Privileged actions require an exact, recent owner approval bound to one
   deterministic action summary.
 - Credentials are removed from worker and test environments.
