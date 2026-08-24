@@ -1884,6 +1884,54 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertNotIn("secret-codex", log_content)
         subject.close()
 
+    @unittest.skipUnless(Path("/usr/bin/sandbox-exec").exists(), "requires macOS Seatbelt")
+    def test_seatbelt_allows_read_only_git_metadata_for_disposable_worktree(self) -> None:
+        worktree = self.root / "seatbelt-worktree"
+        self._run("git", "-C", str(self.repo), "worktree", "add", "--detach", str(worktree), self.base_sha)
+        try:
+            with runner.TestSandbox(self.root / "state-seatbelt-git", worktree) as sandbox:
+                result = runner.run_command(
+                    sandbox.wrap(["/usr/bin/git", "diff", "--check", "HEAD"]),
+                    cwd=worktree,
+                    env=sandbox.env(),
+                    timeout=30,
+                    check=False,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            self._run(
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+                check=False,
+            )
+            self._run("git", "-C", str(self.repo), "worktree", "prune", check=False)
+
+    def test_test_sandbox_resolves_linked_worktree_git_metadata_roots(self) -> None:
+        worktree = self.root / "metadata-worktree"
+        self._run("git", "-C", str(self.repo), "worktree", "add", "--detach", str(worktree), self.base_sha)
+        try:
+            sandbox = runner.TestSandbox(self.root / "state-metadata-git", worktree)
+            roots = sandbox._git_metadata_read_roots()
+            self.assertIn((self.repo / ".git").resolve(), roots)
+            self.assertTrue(all(path.is_dir() for path in roots))
+        finally:
+            self._run(
+                "git",
+                "-C",
+                str(self.repo),
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+                check=False,
+            )
+            self._run("git", "-C", str(self.repo), "worktree", "prune", check=False)
+
     def test_test_sandbox_denies_network(self) -> None:
         host, port = self.server.server_address
         network_code = textwrap.dedent(

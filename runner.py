@@ -2249,6 +2249,7 @@ class TestSandbox:
             self.worktree,
             self.home_dir,
         ]
+        read_roots.extend(self._git_metadata_read_roots())
         if self.xcode_derived_data is not None:
             darwin_temp = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
             developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
@@ -2332,6 +2333,35 @@ class TestSandbox:
         ).strip()
         self.profile_path.write_text(profile, encoding="utf-8")
         return self
+
+    def _git_metadata_read_roots(self) -> list[Path]:
+        marker = self.worktree / ".git"
+        if marker.is_dir():
+            return [marker.resolve()]
+        if not marker.is_file():
+            raise RunnerError("invalid_git_worktree", "Test worktree has no Git metadata marker")
+        try:
+            line = marker.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RunnerError("invalid_git_worktree", "Test worktree Git marker is unreadable") from exc
+        if not line.startswith("gitdir: "):
+            raise RunnerError("invalid_git_worktree", "Test worktree Git marker is invalid")
+        raw_git_dir = Path(line.removeprefix("gitdir: "))
+        git_dir = raw_git_dir.resolve() if raw_git_dir.is_absolute() else (self.worktree / raw_git_dir).resolve()
+        if not git_dir.is_dir():
+            raise RunnerError("invalid_git_worktree", "Test worktree Git directory is unavailable")
+        roots = [git_dir]
+        commondir = git_dir / "commondir"
+        if commondir.is_file():
+            try:
+                raw_common = Path(commondir.read_text(encoding="utf-8").strip())
+            except OSError as exc:
+                raise RunnerError("invalid_git_worktree", "Test worktree common Git directory is unreadable") from exc
+            common = raw_common.resolve() if raw_common.is_absolute() else (git_dir / raw_common).resolve()
+            if not common.is_dir():
+                raise RunnerError("invalid_git_worktree", "Test worktree common Git directory is unavailable")
+            roots.append(common)
+        return list(dict.fromkeys(roots))
 
     def wrap(self, command: list[str]) -> list[str]:
         if self.profile_path is None:
