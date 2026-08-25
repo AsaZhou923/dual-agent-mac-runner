@@ -12,6 +12,7 @@ from unittest import mock
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER_PATH = REPOSITORY_ROOT / "integrations" / "codex" / "run-buzz-acp.py"
 SYSTEM_PROMPT_PATH = REPOSITORY_ROOT / "integrations" / "codex" / "mac-supervisor-system-prompt.md"
+HEARTBEAT_PROMPT_PATH = REPOSITORY_ROOT / "integrations" / "codex" / "mac-supervisor-heartbeat-prompt.md"
 SPEC = importlib.util.spec_from_file_location("buzz_acp_launcher", LAUNCHER_PATH)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import bootstrap guard
     raise RuntimeError("could not load Buzz ACP launcher")
@@ -100,6 +101,8 @@ class BuzzLauncherTests(unittest.TestCase):
         self.assertEqual(child_env["BUZZ_ACP_LAZY_POOL"], "true")
         self.assertEqual(child_env["BUZZ_ACP_HEARTBEAT_INTERVAL"], "900")
         self.assertEqual(child_env["BUZZ_ACP_PERMISSION_MODE"], "default")
+        self.assertEqual(child_env["BUZZ_ACP_HEARTBEAT_PROMPT_FILE"], str(HEARTBEAT_PROMPT_PATH))
+        self.assertNotIn("BUZZ_ACP_HEARTBEAT_PROMPT", child_env)
         self.assertNotIn("BUZZ_ACP_CHANNELS", child_env)
         self.assertNotIn("BUZZ_ACP_MCP_COMMAND", child_env)
 
@@ -138,6 +141,16 @@ class BuzzLauncherTests(unittest.TestCase):
         self.assertIn("`FAILED <job_id> <attempt>`", prompt)
         self.assertIn("never slash or colon forms", prompt)
         self.assertIn("backfill ACK", prompt)
+
+    def test_heartbeat_prompt_recovers_missing_runner_state_publication(self) -> None:
+        prompt = HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("Runner's SQLite ledger", prompt)
+        self.assertIn("original Buzz thread", prompt)
+        self.assertIn("missing exact state", prompt)
+        self.assertIn("`RUNNING <job_id> <attempt>`", prompt)
+        self.assertIn("`VERIFYING <job_id> <attempt>`", prompt)
+        self.assertIn("`DONE <job_id> <attempt>`", prompt)
+        self.assertIn("`FAILED <job_id> <attempt>`", prompt)
 
 
 if __name__ == "__main__":

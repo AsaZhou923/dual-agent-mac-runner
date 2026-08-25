@@ -18,6 +18,9 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
 SETTINGS_PATH = Path(
     os.environ.get("BUZZ_ACP_SETTINGS_PATH", "~/.config/buzz-acp/settings.toml")
 ).expanduser()
+DEFAULT_HEARTBEAT_PROMPT_PATH = Path(__file__).with_name(
+    "mac-supervisor-heartbeat-prompt.md"
+)
 HEX_PUBKEY = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -119,6 +122,11 @@ def main() -> None:
     system_prompt_file = Path(str(settings.get("system_prompt_file", ""))).expanduser()
     if not system_prompt_file.is_file():
         fail("system_prompt_file is missing")
+    heartbeat_prompt_file = Path(
+        str(settings.get("heartbeat_prompt_file", DEFAULT_HEARTBEAT_PROMPT_PATH))
+    ).expanduser()
+    if not heartbeat_prompt_file.is_file():
+        fail("heartbeat_prompt_file is missing")
 
     agents = setting_int(settings, "agents", 1, minimum=1, maximum=1)
     heartbeat_interval = setting_int(settings, "heartbeat_interval", 900)
@@ -182,12 +190,7 @@ def main() -> None:
             "BUZZ_ACP_AGENT_ARGS": "",
             "BUZZ_ACP_AGENTS": str(agents),
             "BUZZ_ACP_HEARTBEAT_INTERVAL": str(heartbeat_interval),
-            "BUZZ_ACP_HEARTBEAT_PROMPT": (
-                "Reconcile Mac Runner status and its SQLite ledger. Check for an "
-                "ownerless non-terminal job or a host/Ollama/Git threshold change. "
-                "If there is no anomaly, do not post to Buzz. Never create side effects "
-                "from a heartbeat."
-            ),
+            "BUZZ_ACP_HEARTBEAT_PROMPT_FILE": str(heartbeat_prompt_file),
             "BUZZ_ACP_IDLE_TIMEOUT": str(idle_timeout_seconds),
             "BUZZ_ACP_MAX_TURN_DURATION": str(max_turn_duration_seconds),
             "BUZZ_ACP_RESPOND_TO": "allowlist",

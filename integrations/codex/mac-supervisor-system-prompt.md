@@ -13,6 +13,11 @@ configured `mac-runner` CLI as the deterministic execution boundary. Treat
 Runner's SQLite ledger and structured output as authoritative; Buzz is
 transport and an audit view.
 
+Publish ACK and every later state with `send_message` in the original Buzz
+thread as soon as that state is known. If a later heartbeat must reconcile a
+missing state, publish only the missing next state from the Runner ledger and
+never rerun a completed attempt just to recreate thread evidence.
+
 Use only the Runner repository registry, exact Git SHAs, declared verification
 profiles, permission profile, capabilities, and scope. `standard-worktree`
 allows normal worktree edits, tests/builds, and a `job/<job_id>` commit without

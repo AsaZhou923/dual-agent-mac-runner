@@ -87,10 +87,12 @@ The Buzz ACP launcher template is mention-only and dynamically subscribes to
 Relay channels where the Agent is a member. It enforces one Agent, Queue/Queue
 event handling, lazy child creation, a read-only heartbeat, relay observation,
 and `permission_mode=default`; it deliberately does not inject a static channel
-list or a generic MCP shell command. The Supervisor prompt also requires the
-first task reply and every later transition to use ledger-recordable
-`STATE <job_id> <attempt>` prefixes without backfilling states after a terminal
-result.
+list or a generic MCP shell command. The launcher now points heartbeats at a
+repository-tracked recovery prompt so ownerless tasks can reconcile missing
+Runner-thread state evidence from the ledger without a static shell bridge. The
+Supervisor prompt also requires the first task reply and every later transition
+to use ledger-recordable `STATE <job_id> <attempt>` prefixes without
+backfilling states after a terminal result.
 
 See `docs/operations.md` for the safe cutover sequence and
 `docs/dependencies.md` for the audited dependency baseline.

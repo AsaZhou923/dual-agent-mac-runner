@@ -18,7 +18,7 @@ owner_public_key = "000000000000000000000000000000000000000000000000000000000000
 relay_observer = true
 
 agents = 1
-heartbeat_interval = 900
+heartbeat_interval = 30
 idle_timeout_seconds = 900
 max_turn_duration_seconds = 7200
 turn_liveness_seconds = 10
@@ -26,3 +26,6 @@ lazy_pool = true
 idle_pool_sleep_seconds = 300
 exit_after_inactivity_seconds = 0
 permission_mode = "default"
+
+# heartbeat_prompt_file may be omitted to use the repository's default
+# mac-supervisor-heartbeat-prompt.md recovery workflow.

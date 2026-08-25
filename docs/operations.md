@@ -30,7 +30,8 @@ Use this order when replacing a running installation:
    legacy wire replay before enabling services.
 7. Deploy the Buzz launcher/settings/prompt, start Runner first, then Buzz ACP.
 8. Verify Runner queue/capabilities, Buzz owner resolution, dynamic channel
-   discovery, Queue/Queue behavior, lazy child creation, heartbeat, and observer.
+   discovery, Queue/Queue behavior, lazy child creation, the repository
+   heartbeat recovery prompt, and observer.
 9. Keep the previous source, configuration, plists, and ledger backup available
    until a fresh cross-machine attempt reaches a consistent terminal state.
 
@@ -39,6 +40,9 @@ the cutover healthy:
 
 - the original thread begins with exact `ACK <job_id> <attempt>` and proceeds
   through on-time `RUNNING`, `VERIFYING`, and one terminal state;
+- if the direct supervisor turn exits before publishing every state, the
+  heartbeat recovery prompt republishes only the missing next state from the
+  Runner ledger into the original Buzz thread;
 - the real macOS Seatbelt profile completes `/usr/bin/git diff --check HEAD`
   without `xcrun_db` denial while the surrounding Darwin temporary directory
   remains unreadable as a subtree;
@@ -116,6 +120,10 @@ reviewed bootstrap.
 Runner SQLite state is authoritative. Buzz publication alone does not prove job
 receipt or completion; use the original thread's ACK, RUNNING, VERIFYING, and
 terminal evidence together with the Runner ledger.
+
+Production Buzz ACP should keep heartbeat reconciliation enabled with a short
+interval (30 seconds in the shipped example) so missing thread-state evidence
+is repaired before operators treat a task as stalled.
 
 `SEND_UNCERTAIN` is a terminal publishing outcome for an attempt and must not be
 automatically retried. The cross-machine publication protocol belongs in the
