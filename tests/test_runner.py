@@ -1620,7 +1620,34 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(result["status"], "DONE")
         self.assertEqual(result["result"]["route"], "ornith")
         self.assertIsNone(result["result"]["commit_sha"])
+        config_proof = result["result"]["configuration"]
+        expected_config_hash = runner.sha256_hex(self.config.config_path.read_bytes())
+        self.assertTrue(config_proof["unchanged"])
+        self.assertEqual(config_proof["before_sha256"], expected_config_hash)
+        self.assertEqual(config_proof["after_sha256"], expected_config_hash)
+        self.assertEqual(config_proof["loaded_sha256"], expected_config_hash)
         self.assertEqual({entry["task"] for entry in self._codex_entries()}, {"decide_route", "accept_result"})
+        subject.close()
+
+    def test_runner_rejects_configuration_change_during_execution(self) -> None:
+        subject = self._runner(max_diff_bytes=128)
+        subject.submit(self._job(write=True, allowed_paths=["allowed.txt"], test_profile="backend-unit"))
+        original_run_tests = subject._run_tests
+
+        def mutate_config_after_tests(*args: object, **kwargs: object) -> dict[str, object]:
+            tests = original_run_tests(*args, **kwargs)
+            config_path = subject.config.config_path
+            config_path.write_text(config_path.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+            return tests
+
+        with mock.patch.object(subject, "_run_tests", side_effect=mutate_config_after_tests), mock.patch.object(
+            subject.worktrees, "commit", wraps=subject.worktrees.commit
+        ) as commit:
+            result = subject.execute("agent-20260821-0042", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "config_changed_during_execution")
+        self.assertFalse(result["error"]["details"]["unchanged"])
+        commit.assert_not_called()
         subject.close()
 
     def test_ornith_tool_budget_forces_final_json_without_more_tools(self) -> None:
@@ -1898,6 +1925,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                     check=False,
                 )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("xcrun_db", result.stderr)
         finally:
             self._run(
                 "git",
@@ -1910,6 +1938,37 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                 check=False,
             )
             self._run("git", "-C", str(self.repo), "worktree", "prune", check=False)
+
+    def test_test_sandbox_isolates_darwin_cache_roots_for_readonly_profiles(self) -> None:
+        with runner.TestSandbox(self.root / "state-darwin-cache", self.repo) as sandbox:
+            self.assertIsNotNone(sandbox.home_dir)
+            self.assertIsNotNone(sandbox.temp_dir)
+            self.assertIsNotNone(sandbox.darwin_user_cache_dir)
+            developer_tools_cache = sandbox.darwin_user_cache_dir / "com.apple.DeveloperTools"
+            clang_cache = sandbox.darwin_user_cache_dir / "clang"
+            self.assertTrue(developer_tools_cache.is_dir())
+            self.assertTrue(clang_cache.is_dir())
+            profile = sandbox.profile_path.read_text(encoding="utf-8")
+            self.assertIn(str(sandbox.temp_dir), profile)
+            self.assertIn(str(sandbox.darwin_user_cache_dir), profile)
+            self.assertIn(str(developer_tools_cache), profile)
+            self.assertIn(str(clang_cache), profile)
+            env = sandbox.env()
+            self.assertEqual(env["TMPDIR"], f"{sandbox.temp_dir}/")
+            self.assertEqual(env["DARWIN_USER_CACHE_DIR"], f"{sandbox.darwin_user_cache_dir}/")
+            self.assertEqual(env["CFFIXED_USER_HOME"], str(sandbox.home_dir))
+        self.assertFalse(developer_tools_cache.exists())
+
+    def test_test_sandbox_reads_selected_versioned_xcode_bundle_without_write_access(self) -> None:
+        developer_dir = "/Applications/Xcode_26.6.app/Contents/Developer"
+        with mock.patch.dict(os.environ, {"DEVELOPER_DIR": developer_dir}):
+            with runner.TestSandbox(self.root / "state-versioned-xcode", self.repo) as sandbox:
+                profile = sandbox.profile_path.read_text(encoding="utf-8")
+                self.assertIn('(subpath "/Applications/Xcode_26.6.app")', profile)
+                write_section = profile.split("(allow file-write*", 1)[1].split("(deny file-write*", 1)[0]
+                self.assertNotIn("Xcode_26.6.app", write_section)
+        with mock.patch.dict(os.environ, {"DEVELOPER_DIR": "/Users/shared/FakeXcode.app/Contents/Developer"}):
+            self.assertNotIn(Path("/Users/shared/FakeXcode.app"), runner.TestSandbox._xcode_read_roots())
 
     def test_test_sandbox_resolves_linked_worktree_git_metadata_roots(self) -> None:
         worktree = self.root / "metadata-worktree"

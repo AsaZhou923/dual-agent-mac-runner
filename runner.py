@@ -455,6 +455,8 @@ class VerificationRun:
 
 @dataclasses.dataclass
 class RunnerConfig:
+    config_path: Path
+    config_sha256: str
     app_dir: Path
     state_dir: Path
     db_path: Path
@@ -483,7 +485,8 @@ class RunnerConfig:
 
     @classmethod
     def load(cls, config_path: Path) -> "RunnerConfig":
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        config_bytes = config_path.read_bytes()
+        data = tomllib.loads(config_bytes.decode("utf-8"))
         app_dir = config_path.parent
         runner_cfg = data["runner"]
         ollama_cfg = data["ollama"]
@@ -630,6 +633,8 @@ class RunnerConfig:
             if owner_pubkey == "0" * 64 or not re.fullmatch(r"[0-9a-f]{64}", owner_pubkey):
                 raise RunnerError("invalid_config", "runner.owner_pubkey must be a real 64-hex owner pubkey")
         return cls(
+            config_path=config_path,
+            config_sha256=sha256_hex(config_bytes),
             app_dir=app_dir,
             state_dir=Path(runner_cfg["state_dir"]).expanduser(),
             db_path=Path(runner_cfg["db_path"]).expanduser(),
@@ -2120,7 +2125,14 @@ class CodexSupervisor:
         self.worker_validator.validate(result)
         return result
 
-    def accept(self, job: dict[str, Any], worker_result: dict[str, Any], tests: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+    def accept(
+        self,
+        job: dict[str, Any],
+        worker_result: dict[str, Any],
+        tests: dict[str, Any],
+        runner_result: dict[str, Any],
+        deadline: Deadline,
+    ) -> dict[str, Any]:
         prompt = textwrap.dedent(
             f"""
             TASK: accept_result
@@ -2136,6 +2148,9 @@ class CodexSupervisor:
 
             Tests:
             {json_dumps(tests)}
+
+            Runner result:
+            {json_dumps(runner_result)}
             """
         ).strip()
         result = self._invoke_json(
@@ -2224,10 +2239,55 @@ class TestSandbox:
         self.home_dir: Path | None = None
         self.profile_path: Path | None = None
         self.xcode_derived_data: Path | None = None
+        self.temp_dir: Path | None = None
+        self.darwin_user_cache_dir: Path | None = None
+
+    @staticmethod
+    def _xcode_read_roots() -> list[Path]:
+        roots = [Path("/Applications/Xcode.app")]
+        developer_dir = os.environ.get("DEVELOPER_DIR", "").strip()
+        if not developer_dir and sys.platform == "darwin" and Path("/usr/bin/xcode-select").is_file():
+            try:
+                selected = subprocess.run(
+                    ["/usr/bin/xcode-select", "-p"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                selected = None
+            if selected is not None and selected.returncode == 0:
+                developer_dir = selected.stdout.strip()
+        if developer_dir:
+            selected_path = Path(developer_dir).expanduser()
+            if selected_path.is_absolute():
+                bundle_root = next(
+                    (path for path in (selected_path, *selected_path.parents) if path.suffix == ".app"),
+                    None,
+                )
+                if bundle_root is not None and bundle_root.parent == Path("/Applications"):
+                    roots.append(bundle_root)
+        unique: dict[str, Path] = {}
+        for path in roots:
+            unique[str(path)] = path
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            unique[str(resolved)] = resolved
+        return list(unique.values())
 
     def __enter__(self) -> "TestSandbox":
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.home_dir = Path(tempfile.mkdtemp(prefix="job-home-", dir=self.base_dir))
+        self.temp_dir = self.home_dir / "tmp"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.darwin_user_cache_dir = self.home_dir / "C"
+        developer_tools_cache = self.darwin_user_cache_dir / "com.apple.DeveloperTools"
+        clang_cache = self.darwin_user_cache_dir / "clang"
+        developer_tools_cache.mkdir(parents=True, exist_ok=True)
+        clang_cache.mkdir(parents=True, exist_ok=True)
         self.profile_path = self.base_dir / f"{self.home_dir.name}.sb"
         xcode_rules = ""
         if self.needs_xcode_derived_data:
@@ -2242,22 +2302,26 @@ class TestSandbox:
             Path("/opt/homebrew"),
             Path("/usr/local"),
             Path("/Library"),
-            Path("/Applications/Xcode.app"),
             Path("/private/var/db/timezone"),
             Path("/private/tmp"),
             Path("/dev"),
             self.worktree,
             self.home_dir,
+            self.temp_dir,
+            self.darwin_user_cache_dir,
+            developer_tools_cache,
+            clang_cache,
         ]
+        read_roots.extend(self._xcode_read_roots())
         read_roots.extend(self._git_metadata_read_roots())
         if self.xcode_derived_data is not None:
             darwin_temp = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
-            developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
+            system_developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
             read_roots.extend(
                 [
                     self.xcode_derived_data,
                     darwin_temp,
-                    developer_tools_cache,
+                    system_developer_tools_cache,
                     darwin_temp.parent / "C" / "clang",
                     Path.home() / "Library" / "Developer" / "CoreSimulator",
                     Path.home() / "Library" / "Developer" / "DVTDownloads" / "Assets" / "MetalToolchain",
@@ -2302,13 +2366,21 @@ class TestSandbox:
                 """
             ).strip()
         read_rules = " ".join(f"(subpath {json.dumps(str(path))})" for path in read_roots)
-        write_roots = [self.worktree, self.home_dir, Path("/private/tmp")]
+        write_roots = [
+            self.worktree,
+            self.home_dir,
+            self.temp_dir,
+            self.darwin_user_cache_dir,
+            developer_tools_cache,
+            clang_cache,
+            Path("/private/tmp"),
+        ]
         if self.xcode_derived_data is not None:
             write_roots.extend(
                 [
                     self.xcode_derived_data,
                     darwin_temp,
-                    developer_tools_cache,
+                    system_developer_tools_cache,
                     darwin_temp.parent / "C" / "clang",
                 ]
             )
@@ -2379,13 +2451,12 @@ class TestSandbox:
         ]
 
     def env(self) -> dict[str, str]:
-        if self.home_dir is None:
+        if self.home_dir is None or self.temp_dir is None or self.darwin_user_cache_dir is None:
             raise RuntimeError("Sandbox not initialized")
         env = safe_subprocess_env(allow_credentials=False, home=str(self.home_dir))
-        temp_dir = self.home_dir / "tmp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
         env["CFFIXED_USER_HOME"] = str(self.home_dir)
-        env["TMPDIR"] = f"{temp_dir}/"
+        env["DARWIN_USER_CACHE_DIR"] = f"{self.darwin_user_cache_dir}/"
+        env["TMPDIR"] = f"{self.temp_dir}/"
         env["PYTHONPYCACHEPREFIX"] = str(self.home_dir / ".cache" / "python")
         return env
 
@@ -2932,9 +3003,11 @@ class Runner:
             worker_result: dict[str, Any] | None = None
             tests: dict[str, Any] | None = None
             artifacts: dict[str, str] = {}
+            config_before: dict[str, str] | None = None
             try:
                 if job["status"] == "VERIFYING":
                     return self._resume_verifying(job, deadline)
+                config_before = self._configuration_fingerprint()
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"VALIDATED"}, "SUPERVISING", lease_expires=lease)
                 route = self.supervisor.decide(job, self.status(), deadline)
                 artifacts["route_decision"] = self._write_artifact(job, "route-decision", route)
@@ -2966,13 +3039,23 @@ class Runner:
                         f"Test profile {failing['profile'] if failing else 'unknown'} exited with code {tests['exit_code']}",
                         details={"tests": tests},
                     )
-                result = self._finalize(job, worktree, worker_result, tests, deadline, route=route, artifacts=artifacts)
+                assert config_before is not None
+                result = self._finalize(
+                    job,
+                    worktree,
+                    worker_result,
+                    tests,
+                    deadline,
+                    route=route,
+                    artifacts=artifacts,
+                    config_before=config_before,
+                )
                 artifacts["acceptance"] = str(self._artifact_path(job, "acceptance"))
                 artifacts["result"] = str(self._artifact_path(job, "result"))
                 result["artifacts"] = dict(sorted(artifacts.items()))
                 self.result_validator.validate(result)
                 self._write_artifact(job, "result", result)
-                acceptance = self.supervisor.accept(job, worker_result, tests, deadline)
+                acceptance = self.supervisor.accept(job, worker_result, tests, result, deadline)
                 artifacts["acceptance"] = self._write_artifact(job, "acceptance", acceptance)
                 result["supervisor"]["acceptance"] = acceptance
                 result["artifacts"] = dict(sorted(artifacts.items()))
@@ -3629,6 +3712,17 @@ class Runner:
         }
         return tests_payload
 
+    def _configuration_fingerprint(self) -> dict[str, str]:
+        try:
+            config_bytes = self.config.config_path.read_bytes()
+        except OSError as exc:
+            raise RunnerError("config_fingerprint_unavailable", "Runner configuration file is unreadable") from exc
+        return {
+            "config_path": str(self.config.config_path),
+            "loaded_sha256": self.config.config_sha256,
+            "current_sha256": sha256_hex(config_bytes),
+        }
+
     def _finalize(
         self,
         job: dict[str, Any],
@@ -3639,10 +3733,25 @@ class Runner:
         *,
         route: dict[str, Any] | None,
         artifacts: dict[str, str],
+        config_before: dict[str, str],
     ) -> dict[str, Any]:
         payload = job["payload"]
         commit_sha: str | None = None
         repo = self.worktrees.repo(payload["repo_id"])
+        config_after = self._configuration_fingerprint()
+        configuration = {
+            "config_path": config_after["config_path"],
+            "before_sha256": config_before["current_sha256"],
+            "after_sha256": config_after["current_sha256"],
+            "loaded_sha256": config_after["loaded_sha256"],
+            "unchanged": config_before["current_sha256"] == config_after["current_sha256"] == config_after["loaded_sha256"],
+        }
+        if not configuration["unchanged"]:
+            raise RunnerError(
+                "config_changed_during_execution",
+                "Runner configuration changed while the job was executing",
+                details=configuration,
+            )
         if payload["permission_profile"] == "standard-worktree":
             changed_files, diff_bytes, diff_hash = self.worktrees.write_gate(repo, worktree, self._effective_allowed_paths(payload))
             if changed_files > self.config.max_changed_files:
@@ -3661,6 +3770,7 @@ class Runner:
             "findings": worker_result["findings"],
             "test_exit_code": tests.get("exit_code"),
             "diff_hash": diff_hash,
+            "configuration": configuration,
             "commit_sha": commit_sha,
             "duration_seconds": round(deadline.elapsed(), 3),
             "errors": list(worker_result.get("errors", [])),

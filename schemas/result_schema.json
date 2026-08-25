@@ -85,6 +85,39 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_path",
+        "before_sha256",
+        "after_sha256",
+        "loaded_sha256",
+        "unchanged"
+      ],
+      "properties": {
+        "config_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "before_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "after_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "loaded_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "unchanged": {
+          "type": "boolean"
+        }
+      }
+    },
     "commit_sha": {
       "type": [
         "string",
