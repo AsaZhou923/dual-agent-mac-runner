@@ -25,6 +25,7 @@ native_tool_calls_required = true
 codex_path = "codex"
 model = ""
 allow_write_tasks = false
+require_source_metadata = true
 
 [capabilities]
 image_generation = false

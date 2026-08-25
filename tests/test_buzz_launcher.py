@@ -140,17 +140,22 @@ class BuzzLauncherTests(unittest.TestCase):
         self.assertIn("`DONE <job_id> <attempt>`", prompt)
         self.assertIn("`FAILED <job_id> <attempt>`", prompt)
         self.assertIn("never slash or colon forms", prompt)
-        self.assertIn("backfill ACK", prompt)
+        self.assertIn("automatically retried", prompt)
 
     def test_heartbeat_prompt_recovers_missing_runner_state_publication(self) -> None:
         prompt = HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
         self.assertIn("Runner's SQLite ledger", prompt)
-        self.assertIn("original Buzz thread", prompt)
-        self.assertIn("missing exact state", prompt)
-        self.assertIn("`RUNNING <job_id> <attempt>`", prompt)
-        self.assertIn("`VERIFYING <job_id> <attempt>`", prompt)
-        self.assertIn("`DONE <job_id> <attempt>`", prompt)
-        self.assertIn("`FAILED <job_id> <attempt>`", prompt)
+        self.assertIn("publisher receipt database", prompt)
+        self.assertIn("SEND_UNCERTAIN", prompt)
+        self.assertIn("must never publish or retry", prompt)
+        self.assertIn("do not post to Buzz", prompt)
+
+    def test_supervisor_prompt_requires_source_reference_and_separates_publishers(self) -> None:
+        prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("metadata.source_channel_id", prompt)
+        self.assertIn("metadata.source_event_id", prompt)
+        self.assertIn("separate deterministic state publisher", prompt)
+        self.assertIn("Do not duplicate those messages manually", prompt)
 
 
 if __name__ == "__main__":

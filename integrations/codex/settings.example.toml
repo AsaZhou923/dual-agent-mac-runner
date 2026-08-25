@@ -29,3 +29,14 @@ permission_mode = "default"
 
 # heartbeat_prompt_file may be omitted to use the repository's default
 # mac-supervisor-heartbeat-prompt.md recovery workflow.
+
+# The deterministic state publisher is a separate LaunchAgent. It publishes
+# only VERIFYING and terminal Runner events and never exposes credentials to
+# Runner, Codex, or Ornith.
+state_publisher_enabled = false
+runner_db_path = "~/.local/state/mac-runner/runner.db"
+state_publisher_db_path = "~/.local/state/buzz-acp/state-publisher.db"
+state_publisher_log_path = "~/.local/state/buzz-acp/state-publisher.jsonl"
+buzz_cli_executable = "/absolute/path/to/buzz"
+state_publisher_poll_seconds = 1
+state_publisher_send_timeout_seconds = 30

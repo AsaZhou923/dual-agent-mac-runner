@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.mac-supervisor-state-publisher</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON_PATH__</string>
+    <string>__REPOSITORY_ROOT__/integrations/codex/run-state-publisher.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BUZZ_ACP_SETTINGS_PATH</key>
+    <string>__BUZZ_SETTINGS_PATH__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>__REPOSITORY_ROOT__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>Umask</key>
+  <integer>63</integer>
+
+  <key>StandardOutPath</key>
+  <string>__BUZZ_STATE_ROOT__/state-publisher.stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__BUZZ_STATE_ROOT__/state-publisher.stderr.log</string>
+</dict>
+</plist>

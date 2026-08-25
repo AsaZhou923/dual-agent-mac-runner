@@ -64,6 +64,11 @@ WIRE_PAYLOAD_MAX_BYTES = 48 * 1024
 PERMISSION_PROFILES = {"observe", "standard-worktree", "operational", "privileged"}
 SCOPE_ROOTS = {"metadata-only", "worktree", "registered-checkout"}
 NETWORK_MODES = {"none", "relay-only", "declared-remotes-and-registries"}
+SOURCE_CHANNEL_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+SOURCE_EVENT_ID = re.compile(r"^[0-9a-f]{64}$")
 OPERATIONAL_CAPABILITIES = {
     "prepare-registered-repo",
     "sync-registered-repo",
@@ -488,6 +493,7 @@ class RunnerConfig:
     supervisor_codex_path: str
     supervisor_model: str | None
     supervisor_allow_write_tasks: bool
+    supervisor_require_source_metadata: bool
     capabilities: dict[str, bool]
     repos: dict[str, RepoConfig]
     capability_config: dict[str, CapabilityConfig]
@@ -679,6 +685,9 @@ class RunnerConfig:
             else:
                 capability_config[name] = CapabilityConfig(enabled=bool(raw_capabilities.get(name, False)))
         raw_model = str(supervisor_cfg.get("model", "")).strip()
+        require_source_metadata = supervisor_cfg.get("require_source_metadata", False)
+        if not isinstance(require_source_metadata, bool):
+            raise RunnerError("invalid_config", "supervisor.require_source_metadata must be boolean")
         service_label = str(runner_cfg.get("service_label", "")).strip() or None
         if service_label is not None and not re.fullmatch(r"[A-Za-z0-9.-]{1,255}", service_label):
             raise RunnerError("invalid_config", "runner.service_label must be a safe LaunchAgent label")
@@ -745,6 +754,7 @@ class RunnerConfig:
             supervisor_codex_path=str(supervisor_cfg["codex_path"]),
             supervisor_model=raw_model or None,
             supervisor_allow_write_tasks=bool(supervisor_cfg["allow_write_tasks"]),
+            supervisor_require_source_metadata=require_source_metadata,
             capabilities=dict(sorted(raw_capabilities.items())),
             repos=repos,
             capability_config=capability_config,
@@ -2940,7 +2950,33 @@ class Runner:
             if permission_profile == "privileged":
                 self._assert_owner_approval(payload, capability)
 
+    @staticmethod
+    def _source_reference(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+        metadata = payload.get("metadata")
+        canonical = metadata if isinstance(metadata, dict) else {}
+        context = payload.get("context")
+        context_metadata = context.get("metadata") if isinstance(context, dict) else None
+        legacy = context_metadata if isinstance(context_metadata, dict) else {}
+        channel_id = canonical.get("source_channel_id") or legacy.get("source_channel_id")
+        event_id = canonical.get("source_event_id") or legacy.get("source_event_id")
+        return (
+            channel_id if isinstance(channel_id, str) else None,
+            event_id if isinstance(event_id, str) else None,
+        )
+
     def validate_payload(self, payload: dict[str, Any]) -> None:
+        if self.config.supervisor_require_source_metadata:
+            source_channel_id, source_event_id = self._source_reference(payload)
+            if not (
+                source_channel_id
+                and SOURCE_CHANNEL_ID.fullmatch(source_channel_id)
+                and source_event_id
+                and SOURCE_EVENT_ID.fullmatch(source_event_id)
+            ):
+                raise RunnerError(
+                    "source_reference_required",
+                    "Buzz-origin jobs must include valid source_channel_id and source_event_id metadata",
+                )
         if payload["repo_id"] not in self.config.repos:
             raise RunnerError("unknown_repo", f"Repo {payload['repo_id']} is not in the allowlist")
         repo = self.worktrees.repo(payload["repo_id"])
@@ -3113,6 +3149,7 @@ class Runner:
             "git": {"worktrees": len(list(self.config.worktree_root.glob("*/*"))), "dirty_outside_jobs": False},
             "runner": {
                 "write_enabled": self.config.supervisor_allow_write_tasks,
+                "source_metadata_required": self.config.supervisor_require_source_metadata,
                 "task_types": task_types,
                 "self_update": {
                     "enabled": bool(self_update_binding.enabled),
@@ -3141,6 +3178,21 @@ class Runner:
         last_heartbeat = 0.0
         last_busy_summary = 0.0
         while not self.shutdown_requested:
+            try:
+                with FileLock(self.lock_path):
+                    stale_jobs = self.ledger.mark_stale_active_jobs_failed()
+            except RunnerError as exc:
+                if exc.code != "runner_busy":
+                    raise
+                stale_jobs = []
+            if stale_jobs:
+                self.ledger._log(
+                    "serve_failed_stale_jobs",
+                    jobs=[
+                        {"job_id": job["job_id"], "attempt": job["attempt"]}
+                        for job in stale_jobs
+                    ],
+                )
             now = utc_now()
             status = self.status()
             status_hash = sha256_hex(json_dumps(status).encode("utf-8"))
@@ -3808,7 +3860,10 @@ class Runner:
                     destination = (candidate_dir / member.name).resolve()
                     if destination != candidate_dir and candidate_dir not in destination.parents:
                         raise RunnerError("path_escape", f"Archive member escaped candidate directory: {member.name}")
-                tar.extractall(candidate_dir, members=members, filter="data")
+                try:
+                    tar.extractall(candidate_dir, members=members, filter="data")
+                except TypeError:
+                    tar.extractall(candidate_dir, members=members)
         finally:
             tar_path.unlink(missing_ok=True)
         (candidate_dir / ".source-commit").write_text(f"{payload['target_sha']}\n", encoding="utf-8")
@@ -4147,7 +4202,8 @@ class Runner:
         if not repo.canonical_remote_url or "github.com" not in repo.canonical_remote_url:
             raise RunnerError("capability_not_configured", "manage-pr currently supports only configured GitHub remotes")
         title = f"{branch}"
-        body = f"Source channel: {payload.get('metadata', {}).get('source_channel_id', 'unknown')}\nSource event: {payload.get('metadata', {}).get('source_event_id', 'unknown')}"
+        source_channel_id, source_event_id = self._source_reference(payload)
+        body = f"Source channel: {source_channel_id or 'unknown'}\nSource event: {source_event_id or 'unknown'}"
         env = safe_subprocess_env()
         branch_ref = run_command(
             [GIT_BIN, "-C", str(repo.path), "ls-remote", "--heads", remote, branch],

@@ -51,6 +51,11 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
   bounds; booleans and non-integers remain invalid.
 - Privileged actions require an exact, recent owner approval bound to one
   deterministic action summary.
+- Production intake can require a canonical Buzz channel/event reference before
+  accepting work, so every publishable state has one deterministic reply target.
+- A separate fail-closed publisher reads only Runner event ids, states, and
+  source references. It records confirmed Buzz event ids in its own SQLite
+  database and never retries an uncertain send.
 - Credentials are removed from worker and test environments.
 - Runner state, task artifacts, worktrees, logs, and model files stay outside Git.
 
@@ -64,7 +69,8 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
 - `scripts/` — CLI wrapper plus the external self-update helper to install
   outside the app directory before enabling privileged Runner self-update.
 - `launchd/` — parameterized LaunchAgent template.
-- `integrations/codex/` — Mac Codex Supervisor and Buzz ACP integration.
+- `integrations/codex/` — Mac Codex Supervisor, Buzz ACP, and deterministic
+  ledger-to-thread state publisher integration.
 - `agents/ornith/` — trackable Ollama model declaration; never model weights.
 
 ## Local setup
@@ -85,14 +91,13 @@ Keychain value, Codex session, Ollama manifest, GGUF file, log, or worktree.
 
 The Buzz ACP launcher template is mention-only and dynamically subscribes to
 Relay channels where the Agent is a member. It enforces one Agent, Queue/Queue
-event handling, lazy child creation, a read-only heartbeat, relay observation,
-and `permission_mode=default`; it deliberately does not inject a static channel
-list or a generic MCP shell command. The launcher now points heartbeats at a
-repository-tracked recovery prompt so ownerless tasks can reconcile missing
-Runner-thread state evidence from the ledger without a static shell bridge. The
-Supervisor prompt also requires the first task reply and every later transition
-to use ledger-recordable `STATE <job_id> <attempt>` prefixes without
-backfilling states after a terminal result.
+event handling, lazy child creation, a read-only audit heartbeat, relay
+observation, and `permission_mode=default`; it deliberately does not inject a
+static channel list or a generic MCP shell command. The Supervisor owns exact
+`ACK` and `RUNNING` replies and must attach the source channel/event reference to
+the Runner job. The separate state-publisher LaunchAgent owns exact `VERIFYING`
+and terminal replies. Heartbeats report publisher anomalies but never resend
+lifecycle states.
 
 See `docs/operations.md` for the safe cutover sequence and
 `docs/dependencies.md` for the audited dependency baseline.

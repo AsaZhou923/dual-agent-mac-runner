@@ -6,9 +6,10 @@ logs, task payloads or artifacts, Codex/Buzz sessions, worktrees, model manifest
 GGUF files, Ollama blobs, caches, or installed LaunchAgent plists.
 
 Buzz private keys and authorization tags must remain in macOS Keychain. The
-integration launcher may read them only at process startup and must pass them
-only to the Buzz ACP process. Runner worker and test environments must remain
-credential-free.
+integration launcher and deterministic state publisher may read them only at
+process startup and pass them only to Buzz ACP or the fixed Buzz CLI process.
+They must never place secrets in argv, logs, publisher SQLite rows, Runner,
+Codex, Ornith, worker, or test environments.
 
 Keep operational capabilities default-deny and bind them to fixed remotes,
 branch prefixes, package names/versions, and user-service labels in external

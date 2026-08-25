@@ -274,6 +274,7 @@ class RunnerTests(unittest.TestCase):
         self,
         *,
         allow_write_tasks: bool = True,
+        require_source_metadata: bool = False,
         model: str = "",
         max_diff_bytes: int = 4096,
         owner_pubkey: str = "",
@@ -312,6 +313,7 @@ class RunnerTests(unittest.TestCase):
             codex_path = "{self.fake_codex}"
             model = "{model}"
             allow_write_tasks = {str(allow_write_tasks).lower()}
+            require_source_metadata = {str(require_source_metadata).lower()}
 
             [capabilities]
             image_generation = false
@@ -410,8 +412,8 @@ class RunnerTests(unittest.TestCase):
             metadata={
                 "remote_url": "https://example.invalid/audit-only.git",
                 "branch": "audit-only",
-                "source_channel_id": "channel",
-                "source_event_id": "event",
+                "source_channel_id": "123e4567-e89b-12d3-a456-426614174000",
+                "source_event_id": "a" * 64,
             },
         )
         payload.update(overrides)
@@ -1859,7 +1861,10 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                 scope={"root": "registered-checkout", "paths": []},
                 network={"mode": "declared-remotes-and-registries"},
                 verification_profiles=["review-readonly"],
-                metadata={"source_channel_id": "chan", "source_event_id": "evt"},
+                metadata={
+                    "source_channel_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "source_event_id": "a" * 64,
+                },
             )
         )["payload"]
         calls: list[list[str]] = []
@@ -2593,6 +2598,65 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         rejected = subject.submit({"schema": "mac-job/v1"})
         self.assertEqual(rejected["status"], "REJECTED")
         self.assertEqual(rejected["error"]["code"], "schema_validation_failed")
+        subject.close()
+
+    def test_production_source_metadata_gate_accepts_canonical_and_legacy_references(self) -> None:
+        subject = runner.Runner(
+            runner.RunnerConfig.load(self._write_config(require_source_metadata=True))
+        )
+        missing = subject.submit(self._job(job_id="missing-source"))
+        self.assertEqual(missing["status"], "REJECTED")
+        self.assertEqual(missing["error"]["code"], "source_reference_required")
+
+        canonical = subject.submit(
+            self._job(
+                job_id="canonical-source",
+                metadata={
+                    "source_channel_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "source_event_id": "a" * 64,
+                },
+            )
+        )
+        self.assertEqual(canonical["status"], "VALIDATED")
+
+        legacy = subject.submit(
+            self._job(
+                job_id="legacy-source",
+                context={
+                    "metadata": {
+                        "source_channel_id": "123e4567-e89b-12d3-a456-426614174000",
+                        "source_event_id": "b" * 64,
+                    }
+                },
+            )
+        )
+        self.assertEqual(legacy["status"], "VALIDATED")
+        subject.close()
+
+    def test_serve_reconciles_expired_inflight_job_without_new_pending_work(self) -> None:
+        subject = self._runner()
+        subject.submit(self._job(job_id="stale-without-pending"))
+        subject.ledger.transition(
+            "stale-without-pending",
+            1,
+            {"VALIDATED"},
+            "SUPERVISING",
+            lease_expires=0.0,
+        )
+        status_calls = 0
+
+        def status_then_stop() -> dict[str, object]:
+            nonlocal status_calls
+            status_calls += 1
+            subject.shutdown_requested = True
+            return {"queue": {"running": 0, "pending": 0, "retryable": 0}}
+
+        with mock.patch.object(subject, "status", side_effect=status_then_stop):
+            subject.serve(poll_seconds=1, heartbeat_seconds=60, busy_summary_seconds=60)
+        self.assertEqual(status_calls, 1)
+        failed = subject.get("stale-without-pending", 1)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "stale_inflight_job")
         subject.close()
 
     def test_deadline_applies_to_subprocesses(self) -> None:

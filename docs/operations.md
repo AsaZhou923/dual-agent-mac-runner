@@ -17,9 +17,11 @@ real usernames, paths, identity values, or credentials.
 
 Use this order when replacing a running installation:
 
-1. Record both LaunchAgents, PIDs, Runner status, repository fingerprints, and
-   SQLite integrity/schema/job/event counts.
-2. Stop Buzz ACP, then Runner, and confirm that no process can write the ledger.
+1. Record all three LaunchAgents, PIDs, Runner status, repository fingerprints,
+   Runner/publisher SQLite integrity, schema, job, event, cursor, and publication
+   counts.
+2. Stop Buzz ACP and the state publisher, then Runner, and confirm that no
+   process can write either database.
 3. Back up Runner source/config/ledger/LaunchAgent and the Buzz launcher,
    settings, prompt, and LaunchAgent without exporting Keychain secrets.
 4. Run unit tests, schema checks, plist lint, and configuration preflight from
@@ -28,10 +30,11 @@ Use this order when replacing a running installation:
    apply the additive SQLite migration and legacy-row backfill.
 6. Confirm SQLite integrity, job/event counts, terminal-state counts, and exact
    legacy wire replay before enabling services.
-7. Deploy the Buzz launcher/settings/prompt, start Runner first, then Buzz ACP.
+7. Deploy the Buzz launcher/settings/prompts and state publisher. Start Runner,
+   then the state publisher, then Buzz ACP.
 8. Verify Runner queue/capabilities, Buzz owner resolution, dynamic channel
-   discovery, Queue/Queue behavior, lazy child creation, the repository
-   heartbeat recovery prompt, and observer.
+   discovery, Queue/Queue behavior, lazy child creation, the repository audit
+   heartbeat, state-publisher cursor/receipt health, and observer.
 9. Keep the previous source, configuration, plists, and ledger backup available
    until a fresh cross-machine attempt reaches a consistent terminal state.
 
@@ -40,9 +43,11 @@ the cutover healthy:
 
 - the original thread begins with exact `ACK <job_id> <attempt>` and proceeds
   through on-time `RUNNING`, `VERIFYING`, and one terminal state;
-- if the direct supervisor turn exits before publishing every state, the
-  heartbeat recovery prompt republishes only the missing next state from the
-  Runner ledger into the original Buzz thread;
+- the job payload contains a canonical 36-character source channel UUID and
+  64-hex source event id, and production has
+  `supervisor.require_source_metadata=true`;
+- the direct supervisor publishes ACK/RUNNING, the deterministic publisher
+  publishes VERIFYING/terminal, and the heartbeat does not duplicate either;
 - the real macOS Seatbelt profile completes `/usr/bin/git diff --check HEAD`
   without `xcrun_db` denial while the surrounding Darwin temporary directory
   remains unreadable as a subtree;
@@ -121,10 +126,41 @@ Runner SQLite state is authoritative. Buzz publication alone does not prove job
 receipt or completion; use the original thread's ACK, RUNNING, VERIFYING, and
 terminal evidence together with the Runner ledger.
 
-Production Buzz ACP should keep heartbeat reconciliation enabled with a short
-interval (30 seconds in the shipped example) so missing thread-state evidence
-is repaired before operators treat a task as stalled.
+### Deterministic Buzz state publication
+
+Run `integrations/codex/run-state-publisher.py` as its own LaunchAgent using the
+example plist. It reads the Runner database in SQLite read-only mode and queries
+only event identity/state plus canonical source references. It publishes
+`VERIFYING` and the first terminal state to the original thread with exact
+`VERIFYING|DONE|FAILED <job_id> <attempt>` content, while Mac Codex continues to
+own ACK and RUNNING.
+
+The publisher stores its cursor and receipts outside the repository. On first
+start it seeds the cursor at the current maximum Runner event id, so deployment
+never backfills historical attempts. Before every network send it commits a
+`PENDING` row. A confirmed Buzz event id changes that row to `SENT`; timeout,
+process interruption, nonzero exit, invalid JSON, or a missing event id changes
+it to `SEND_UNCERTAIN`. Startup converts abandoned `PENDING` rows to
+`SEND_UNCERTAIN`. Later states for that attempt are `SUPPRESSED`, never resent.
+Missing or invalid source references are `UNROUTABLE`.
+
+Use these read-only checks after deployment:
+
+```sh
+python3 integrations/codex/run-state-publisher.py --check
+sqlite3 -readonly ~/.local/state/buzz-acp/state-publisher.db \
+  "SELECT status, COUNT(*) FROM publications GROUP BY status;"
+sqlite3 -readonly ~/.local/state/buzz-acp/state-publisher.db \
+  "SELECT value FROM publisher_meta WHERE key='runner_event_cursor';"
+```
+
+Production Buzz ACP may retain the 30-second heartbeat as an audit backstop. It
+reports expired Runner leases and publisher `UNROUTABLE`/`SEND_UNCERTAIN`
+records, but never publishes or retries lifecycle states. The Runner daemon also
+reconciles expired `SUPERVISING`, `PREPARING`, and `RUNNING` leases every service
+loop when it can acquire the task lock, even if no new pending job exists.
 
 `SEND_UNCERTAIN` is a terminal publishing outcome for an attempt and must not be
-automatically retried. The cross-machine publication protocol belongs in the
-parent dual-agent system, not in Runner's deterministic state machine.
+automatically retried. Windows reconciliation policy remains in the parent
+dual-agent system; credentialed transport remains in the separate Supervisor
+integration process, never in Runner's deterministic state machine.
