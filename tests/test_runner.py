@@ -8,6 +8,7 @@ import signal
 import sqlite3
 import socketserver
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -91,8 +92,12 @@ class OllamaHandler(http.server.BaseHTTPRequestHandler):
                     }
                 }
             else:
+                assert len(messages) == 1
                 assert messages[-1]["role"] == "user"
                 assert "tool budget is exhausted" in messages[-1]["content"]
+                assert "Bounded readonly tool evidence" in messages[-1]["content"]
+                assert len(messages[-1]["content"]) < 20000
+                assert payload["format"] == runner.WORKER_SCHEMA
                 response = {
                     "message": {
                         "content": json.dumps(
@@ -108,6 +113,25 @@ class OllamaHandler(http.server.BaseHTTPRequestHandler):
                         )
                     }
                 }
+        elif self.mode == "context_direct":
+            assert "Do not call tools for this canary." in messages[-1]["content"]
+            assert "Task context" in messages[-1]["content"]
+            response = {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "findings": [
+                                {
+                                    "severity": "info",
+                                    "title": "Context honored",
+                                    "detail": "Returned findings without a tool call",
+                                }
+                            ]
+                        }
+                    ),
+                    "tool_calls": [],
+                }
+            }
         else:
             raise AssertionError(f"unknown mode {self.mode}")
         encoded = json.dumps(response).encode("utf-8")
@@ -414,7 +438,7 @@ class RunnerTests(unittest.TestCase):
 
     def _fake_codex_script(self) -> str:
         return textwrap.dedent(
-            f"""#!/opt/homebrew/bin/python3
+            f"""#!{sys.executable}
 import json
 import os
 import re
@@ -1658,6 +1682,26 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(result["status"], "DONE")
         self.assertEqual(result["result"]["findings"][0]["title"], "Tool budget summarized")
         self.assertEqual(self._git(self.repo, "status", "--porcelain=v1", "--untracked-files=all"), "")
+        subject.close()
+
+    def test_ornith_receives_nested_policy_v2_task_context(self) -> None:
+        OllamaHandler.mode = "context_direct"
+        subject = self._runner(max_diff_bytes=128)
+        stored = subject.submit(
+            self._policy_v2_job(
+                job_id="nested-context",
+                execution_route="ornith",
+                preferred_worker="ornith",
+                context={
+                    "summary": "Minimal post-deploy canary.",
+                    "instructions": "Do not call tools for this canary.",
+                    "acceptance_criteria": ["Return one info finding"],
+                },
+            )
+        )
+        stored["route"] = "ornith"
+        result = subject._run_worker(stored, self.repo, runner.Deadline(30))
+        self.assertEqual(result["findings"][0]["title"], "Context honored")
         subject.close()
 
     def test_read_file_tool_honors_max_chars_with_truncation(self) -> None:
