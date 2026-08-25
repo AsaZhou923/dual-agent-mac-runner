@@ -2241,6 +2241,7 @@ class TestSandbox:
         self.xcode_derived_data: Path | None = None
         self.temp_dir: Path | None = None
         self.darwin_user_cache_dir: Path | None = None
+        self.system_temp_dir: Path | None = None
 
     @staticmethod
     def _xcode_read_roots() -> list[Path]:
@@ -2284,6 +2285,7 @@ class TestSandbox:
         self.temp_dir = self.home_dir / "tmp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.darwin_user_cache_dir = self.home_dir / "C"
+        self.system_temp_dir = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
         developer_tools_cache = self.darwin_user_cache_dir / "com.apple.DeveloperTools"
         clang_cache = self.darwin_user_cache_dir / "clang"
         developer_tools_cache.mkdir(parents=True, exist_ok=True)
@@ -2311,6 +2313,7 @@ class TestSandbox:
             self.darwin_user_cache_dir,
             developer_tools_cache,
             clang_cache,
+            self.system_temp_dir,
         ]
         read_roots.extend(self._xcode_read_roots())
         read_roots.extend(self._git_metadata_read_roots())
@@ -2373,6 +2376,7 @@ class TestSandbox:
             self.darwin_user_cache_dir,
             developer_tools_cache,
             clang_cache,
+            self.system_temp_dir,
             Path("/private/tmp"),
         ]
         if self.xcode_derived_data is not None:
@@ -3546,7 +3550,7 @@ class Runner:
             self.result_validator.validate(result)
         except RunnerError as exc:
             raise RunnerError("verification_artifact_invalid", "Saved VERIFYING artifacts failed validation") from exc
-        acceptance = self.supervisor.accept(job, worker_result, tests, deadline)
+        acceptance = self.supervisor.accept(job, worker_result, tests, result, deadline)
         result["supervisor"]["acceptance"] = acceptance
         result["artifacts"]["acceptance"] = self._write_artifact(job, "acceptance", acceptance)
         self.result_validator.validate(result)

@@ -1630,7 +1630,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         subject.close()
 
     def test_runner_rejects_configuration_change_during_execution(self) -> None:
-        subject = self._runner(max_diff_bytes=128)
+        subject = self._runner(max_diff_bytes=4096)
         subject.submit(self._job(write=True, allowed_paths=["allowed.txt"], test_profile="backend-unit"))
         original_run_tests = subject._run_tests
 
@@ -1944,6 +1944,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             self.assertIsNotNone(sandbox.home_dir)
             self.assertIsNotNone(sandbox.temp_dir)
             self.assertIsNotNone(sandbox.darwin_user_cache_dir)
+            self.assertIsNotNone(sandbox.system_temp_dir)
             developer_tools_cache = sandbox.darwin_user_cache_dir / "com.apple.DeveloperTools"
             clang_cache = sandbox.darwin_user_cache_dir / "clang"
             self.assertTrue(developer_tools_cache.is_dir())
@@ -1953,6 +1954,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             self.assertIn(str(sandbox.darwin_user_cache_dir), profile)
             self.assertIn(str(developer_tools_cache), profile)
             self.assertIn(str(clang_cache), profile)
+            self.assertIn(str(sandbox.system_temp_dir), profile)
             env = sandbox.env()
             self.assertEqual(env["TMPDIR"], f"{sandbox.temp_dir}/")
             self.assertEqual(env["DARWIN_USER_CACHE_DIR"], f"{sandbox.darwin_user_cache_dir}/")
