@@ -2313,7 +2313,6 @@ class TestSandbox:
             self.darwin_user_cache_dir,
             developer_tools_cache,
             clang_cache,
-            self.system_temp_dir,
         ]
         read_roots.extend(self._xcode_read_roots())
         read_roots.extend(self._git_metadata_read_roots())

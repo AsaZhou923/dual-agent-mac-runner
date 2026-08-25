@@ -1954,7 +1954,11 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             self.assertIn(str(sandbox.darwin_user_cache_dir), profile)
             self.assertIn(str(developer_tools_cache), profile)
             self.assertIn(str(clang_cache), profile)
-            self.assertIn(str(sandbox.system_temp_dir), profile)
+            read_section = profile.split("(allow file-read*", 1)[1].split("(allow file-write*", 1)[0]
+            write_section = profile.split("(allow file-write*", 1)[1].split("(deny file-write*", 1)[0]
+            system_temp_rule = f"(subpath {json.dumps(str(sandbox.system_temp_dir))})"
+            self.assertNotIn(system_temp_rule, read_section)
+            self.assertIn(system_temp_rule, write_section)
             env = sandbox.env()
             self.assertEqual(env["TMPDIR"], f"{sandbox.temp_dir}/")
             self.assertEqual(env["DARWIN_USER_CACHE_DIR"], f"{sandbox.darwin_user_cache_dir}/")
