@@ -2367,7 +2367,10 @@ class TestSandbox:
                     (global-name "com.apple.mobileassetd.v2"))
                 """
             ).strip()
-        read_rules = " ".join(f"(subpath {json.dumps(str(path))})" for path in read_roots)
+        read_rules = " ".join(
+            [f"(subpath {json.dumps(str(path))})" for path in read_roots]
+            + [f"(literal {json.dumps(str(self.system_temp_dir / 'xcrun_db'))})"]
+        )
         write_roots = [
             self.worktree,
             self.home_dir,

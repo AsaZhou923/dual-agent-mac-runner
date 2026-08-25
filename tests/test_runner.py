@@ -1957,7 +1957,9 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             read_section = profile.split("(allow file-read*", 1)[1].split("(allow file-write*", 1)[0]
             write_section = profile.split("(allow file-write*", 1)[1].split("(deny file-write*", 1)[0]
             system_temp_rule = f"(subpath {json.dumps(str(sandbox.system_temp_dir))})"
+            xcrun_cache_rule = f"(literal {json.dumps(str(sandbox.system_temp_dir / 'xcrun_db'))})"
             self.assertNotIn(system_temp_rule, read_section)
+            self.assertIn(xcrun_cache_rule, read_section)
             self.assertIn(system_temp_rule, write_section)
             env = sandbox.env()
             self.assertEqual(env["TMPDIR"], f"{sandbox.temp_dir}/")
