@@ -1371,7 +1371,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         helper_starts: list[list[str]] = []
 
         def fake_popen(args: list[str], **kwargs: object) -> object:
-            if str(self.external_helper) in args:
+            if any(Path(str(item)).resolve() == self.external_helper.resolve() for item in args):
                 self.assertEqual(subject.get(job_id, 1)["status"], "VERIFYING")
                 helper_starts.append(args)
                 return mock.Mock()
@@ -1478,7 +1478,7 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         helper_starts: list[list[str]] = []
 
         def fake_popen(args: list[str], **kwargs: object) -> object:
-            if str(self.external_helper) in args:
+            if any(Path(str(item)).resolve() == self.external_helper.resolve() for item in args):
                 helper_starts.append(args)
                 return mock.Mock()
             return original_popen(args, **kwargs)

@@ -87,7 +87,10 @@ class SelfUpdateHelperTests(unittest.TestCase):
                 return subprocess.CompletedProcess(
                     args,
                     0,
-                    stdout=f"{sys.executable} {self.app / 'runner.py'} --config {self.config} serve\n",
+                    stdout=(
+                        f"{Path(sys.executable).resolve()} {self.app.resolve() / 'runner.py'} "
+                        f"--config {self.config.resolve()} serve\n"
+                    ),
                     stderr="",
                 )
             return real_run(args, **kwargs)
