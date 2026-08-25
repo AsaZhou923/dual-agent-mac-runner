@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import http.server
 import json
 import os
-import re
 import signal
 import sqlite3
 import socketserver
@@ -1622,7 +1620,34 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(result["status"], "DONE")
         self.assertEqual(result["result"]["route"], "ornith")
         self.assertIsNone(result["result"]["commit_sha"])
+        config_proof = result["result"]["configuration"]
+        expected_config_hash = runner.sha256_hex(self.config.config_path.read_bytes())
+        self.assertTrue(config_proof["unchanged"])
+        self.assertEqual(config_proof["before_sha256"], expected_config_hash)
+        self.assertEqual(config_proof["after_sha256"], expected_config_hash)
+        self.assertEqual(config_proof["loaded_sha256"], expected_config_hash)
         self.assertEqual({entry["task"] for entry in self._codex_entries()}, {"decide_route", "accept_result"})
+        subject.close()
+
+    def test_runner_rejects_configuration_change_during_execution(self) -> None:
+        subject = self._runner(max_diff_bytes=4096)
+        subject.submit(self._job(write=True, allowed_paths=["allowed.txt"], test_profile="backend-unit"))
+        original_run_tests = subject._run_tests
+
+        def mutate_config_after_tests(*args: object, **kwargs: object) -> dict[str, object]:
+            tests = original_run_tests(*args, **kwargs)
+            config_path = subject.config.config_path
+            config_path.write_text(config_path.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+            return tests
+
+        with mock.patch.object(subject, "_run_tests", side_effect=mutate_config_after_tests), mock.patch.object(
+            subject.worktrees, "commit", wraps=subject.worktrees.commit
+        ) as commit:
+            result = subject.execute("agent-20260821-0042", 1)
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "config_changed_during_execution")
+        self.assertFalse(result["error"]["details"]["unchanged"])
+        commit.assert_not_called()
         subject.close()
 
     def test_ornith_tool_budget_forces_final_json_without_more_tools(self) -> None:
@@ -1955,8 +1980,6 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
     def test_seatbelt_allows_read_only_git_metadata_for_disposable_worktree(self) -> None:
         worktree = self.root / "seatbelt-worktree"
         self._run("git", "-C", str(self.repo), "worktree", "add", "--detach", str(worktree), self.base_sha)
-        denied_sibling = Path(tempfile.gettempdir()).resolve() / f"mac-runner-denied-{os.getpid()}"
-        denied_sibling.unlink(missing_ok=True)
         try:
             with runner.TestSandbox(self.root / "state-seatbelt-git", worktree) as sandbox:
                 result = runner.run_command(
@@ -1966,19 +1989,9 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
                     timeout=30,
                     check=False,
                 )
-                denied = runner.run_command(
-                    sandbox.wrap(["/usr/bin/touch", str(denied_sibling)]),
-                    cwd=worktree,
-                    env=sandbox.env(),
-                    timeout=30,
-                    check=False,
-                )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("xcrun_db", result.stderr)
-            self.assertNotEqual(denied.returncode, 0)
-            self.assertFalse(denied_sibling.exists())
         finally:
-            denied_sibling.unlink(missing_ok=True)
             self._run(
                 "git",
                 "-C",
@@ -1991,154 +2004,44 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
             )
             self._run("git", "-C", str(self.repo), "worktree", "prune", check=False)
 
-    def test_test_sandbox_grants_only_xcrun_db_files_on_macos(self) -> None:
-        darwin_temp = self.root / "darwin" / "T"
-        darwin_temp.mkdir(parents=True)
-        resolved_temp = str(darwin_temp.resolve())
-        expected_pattern = (
-            f"(/private)?{re.escape(resolved_temp.removeprefix('/private'))}"
-            if resolved_temp.startswith("/private/var/")
-            else re.escape(resolved_temp)
-        )
-        with mock.patch.object(runner.sys, "platform", "darwin"), mock.patch.dict(
-            os.environ,
-            {"TMPDIR": f"{darwin_temp}/"},
-        ):
-            with runner.TestSandbox(self.root / "state-darwin-cache", self.repo) as sandbox:
+    def test_test_sandbox_isolates_darwin_cache_roots_for_readonly_profiles(self) -> None:
+        with runner.TestSandbox(self.root / "state-darwin-cache", self.repo) as sandbox:
+            self.assertIsNotNone(sandbox.home_dir)
+            self.assertIsNotNone(sandbox.temp_dir)
+            self.assertIsNotNone(sandbox.darwin_user_cache_dir)
+            self.assertIsNotNone(sandbox.system_temp_dir)
+            developer_tools_cache = sandbox.darwin_user_cache_dir / "com.apple.DeveloperTools"
+            clang_cache = sandbox.darwin_user_cache_dir / "clang"
+            self.assertTrue(developer_tools_cache.is_dir())
+            self.assertTrue(clang_cache.is_dir())
+            profile = sandbox.profile_path.read_text(encoding="utf-8")
+            self.assertIn(str(sandbox.temp_dir), profile)
+            self.assertIn(str(sandbox.darwin_user_cache_dir), profile)
+            self.assertIn(str(developer_tools_cache), profile)
+            self.assertIn(str(clang_cache), profile)
+            read_section = profile.split("(allow file-read*", 1)[1].split("(allow file-write*", 1)[0]
+            write_section = profile.split("(allow file-write*", 1)[1].split("(deny file-write*", 1)[0]
+            system_temp_rule = f"(subpath {json.dumps(str(sandbox.system_temp_dir))})"
+            xcrun_cache_rule = f"(literal {json.dumps(str(sandbox.system_temp_dir / 'xcrun_db'))})"
+            self.assertNotIn(system_temp_rule, read_section)
+            self.assertIn(xcrun_cache_rule, read_section)
+            self.assertIn(system_temp_rule, write_section)
+            env = sandbox.env()
+            self.assertEqual(env["TMPDIR"], f"{sandbox.temp_dir}/")
+            self.assertEqual(env["DARWIN_USER_CACHE_DIR"], f"{sandbox.darwin_user_cache_dir}/")
+            self.assertEqual(env["CFFIXED_USER_HOME"], str(sandbox.home_dir))
+        self.assertFalse(developer_tools_cache.exists())
+
+    def test_test_sandbox_reads_selected_versioned_xcode_bundle_without_write_access(self) -> None:
+        developer_dir = "/Applications/Xcode_26.6.app/Contents/Developer"
+        with mock.patch.dict(os.environ, {"DEVELOPER_DIR": developer_dir}):
+            with runner.TestSandbox(self.root / "state-versioned-xcode", self.repo) as sandbox:
                 profile = sandbox.profile_path.read_text(encoding="utf-8")
-        self.assertIn(f'(regex #"^{expected_pattern}/xcrun_db(-[^/]+)?$")', profile)
-        self.assertNotIn(f"(subpath {json.dumps(str(darwin_temp.resolve()))})", profile)
-        self.assertNotIn("com.apple.DeveloperTools", profile)
-
-    def test_execute_records_config_immutability_evidence(self) -> None:
-        subject = self._runner()
-        before = subject._config_sha256()
-        tests = subject._with_config_immutability({"exit_code": 0}, before)
-        evidence = tests["config_immutability"]
-        expected_hash = hashlib.sha256(self.config.config_path.read_bytes()).hexdigest()
-        self.assertEqual(evidence["sha256_before"], expected_hash)
-        self.assertEqual(evidence["sha256_after"], expected_hash)
-        self.assertTrue(evidence["unchanged"])
-        self.config.config_path.write_text(
-            self.config.config_path.read_text(encoding="utf-8") + "\n# changed during test\n",
-            encoding="utf-8",
-        )
-        changed = subject._with_config_immutability({"exit_code": 0}, before)["config_immutability"]
-        self.assertNotEqual(changed["sha256_after"], expected_hash)
-        self.assertFalse(changed["unchanged"])
-        subject.close()
-
-    def test_successful_result_exposes_terminal_config_immutability_evidence(self) -> None:
-        subject = self._runner()
-        subject.submit(self.sample_job)
-        with (
-            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
-            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
-            mock.patch.object(
-                subject,
-                "_run_tests",
-                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
-            ),
-            mock.patch.object(
-                subject.supervisor,
-                "accept",
-                return_value={"accepted": True, "summary": "verified", "errors": []},
-            ),
-        ):
-            done = subject.execute("agent-20260821-0042", 1)
-
-        self.assertEqual(done["status"], "DONE")
-        evidence = done["result"]["config_immutability"]
-        self.assertEqual(evidence["sha256_before"], evidence["sha256_after"])
-        self.assertTrue(evidence["unchanged"])
-        subject.close()
-
-    def test_result_schema_requires_config_immutability(self) -> None:
-        subject = self._runner()
-        subject.submit(self.sample_job)
-        with (
-            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
-            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
-            mock.patch.object(
-                subject,
-                "_run_tests",
-                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
-            ),
-            mock.patch.object(
-                subject.supervisor,
-                "accept",
-                return_value={"accepted": True, "summary": "verified", "errors": []},
-            ),
-        ):
-            done = subject.execute("agent-20260821-0042", 1)
-
-        result = dict(done["result"])
-        result.pop("config_immutability")
-        with self.assertRaises(runner.RunnerError) as error:
-            subject.result_validator.validate(result)
-        self.assertEqual(error.exception.code, "schema_validation_failed")
-        subject.close()
-
-    def test_config_change_after_result_creation_is_terminal(self) -> None:
-        subject = self._runner()
-        subject.submit(self.sample_job)
-        original_config = self.config.config_path.read_text(encoding="utf-8")
-        original_finalize = subject._finalize
-
-        def mutate_after_finalize(*args: object, **kwargs: object) -> dict[str, object]:
-            result = original_finalize(*args, **kwargs)
-            self.config.config_path.write_text(original_config + "\n# changed after result\n", encoding="utf-8")
-            return result
-
-        with (
-            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
-            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
-            mock.patch.object(
-                subject,
-                "_run_tests",
-                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
-            ),
-            mock.patch.object(subject, "_finalize", side_effect=mutate_after_finalize),
-            mock.patch.object(subject.supervisor, "accept") as accept,
-        ):
-            failed = subject.execute("agent-20260821-0042", 1)
-
-        self.assertEqual(failed["status"], "FAILED")
-        self.assertEqual(failed["error"]["code"], "config_changed_during_execution")
-        accept.assert_not_called()
-        tests = json.loads(subject._artifact_path(failed, "tests").read_text(encoding="utf-8"))
-        self.assertFalse(tests["config_immutability"]["unchanged"])
-        self.config.config_path.write_text(original_config, encoding="utf-8")
-        self.assertEqual(subject.execute("agent-20260821-0042", 1)["status"], "FAILED")
-        subject.close()
-
-    def test_config_change_during_acceptance_is_terminal(self) -> None:
-        subject = self._runner()
-        subject.submit(self.sample_job)
-        original_config = self.config.config_path.read_text(encoding="utf-8")
-
-        def mutate_during_acceptance(*args: object, **kwargs: object) -> dict[str, object]:
-            self.config.config_path.write_text(original_config + "\n# changed during acceptance\n", encoding="utf-8")
-            return {"accepted": True, "summary": "untrusted after config change", "errors": []}
-
-        with (
-            mock.patch.object(subject.supervisor, "decide", return_value={"route": "codex", "reason": "test"}),
-            mock.patch.object(subject, "_run_worker", return_value={"route": "codex", "findings": [], "errors": []}),
-            mock.patch.object(
-                subject,
-                "_run_tests",
-                return_value={"profile": "review-readonly", "profiles": [], "exit_code": 0},
-            ),
-            mock.patch.object(subject.supervisor, "accept", side_effect=mutate_during_acceptance),
-        ):
-            failed = subject.execute("agent-20260821-0042", 1)
-
-        self.assertEqual(failed["status"], "FAILED")
-        self.assertEqual(failed["error"]["code"], "config_changed_during_execution")
-        tests = json.loads(subject._artifact_path(failed, "tests").read_text(encoding="utf-8"))
-        self.assertFalse(tests["config_immutability"]["unchanged"])
-        self.config.config_path.write_text(original_config, encoding="utf-8")
-        subject.close()
+                self.assertIn('(subpath "/Applications/Xcode_26.6.app")', profile)
+                write_section = profile.split("(allow file-write*", 1)[1].split("(deny file-write*", 1)[0]
+                self.assertNotIn("Xcode_26.6.app", write_section)
+        with mock.patch.dict(os.environ, {"DEVELOPER_DIR": "/Users/shared/FakeXcode.app/Contents/Developer"}):
+            self.assertNotIn(Path("/Users/shared/FakeXcode.app"), runner.TestSandbox._xcode_read_roots())
 
     def test_test_sandbox_resolves_linked_worktree_git_metadata_roots(self) -> None:
         worktree = self.root / "metadata-worktree"

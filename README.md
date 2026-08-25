@@ -32,12 +32,12 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
   operational capabilities use the Runner's fixed path and therefore require `auto`.
 - Approved test profiles executed without `shell=True`.
 - Temporary HOME plus a no-network Seatbelt profile for tests.
-- Read-only macOS verification grants write access only to the current user's
-  `xcrun_db` cache file and its replacement file, not the surrounding Darwin
-  temporary directory.
+- Read-only macOS verification keeps the current user's Darwin temporary tree
+  unreadable, permits the xcrun-required cache writes, and grants read access
+  only to the fixed `xcrun_db` file.
 - Non-operational jobs hash the loaded Runner configuration before execution
-  and after Supervisor acceptance; config drift is terminal and the matching
-  hashes are exposed in the structured result.
+  and before final acceptance; config drift is terminal before a task commit,
+  and matching hashes are exposed in the structured result.
 - Worktree writes are limited by scope, changed-file count, diff size, and
   configured sensitive-path patterns.
 - Operational actions use fixed capability handlers for reversible

@@ -40,10 +40,10 @@ the cutover healthy:
 - the original thread begins with exact `ACK <job_id> <attempt>` and proceeds
   through on-time `RUNNING`, `VERIFYING`, and one terminal state;
 - the real macOS Seatbelt profile completes `/usr/bin/git diff --check HEAD`
-  without `xcrun_db` denial while a sibling file in the same Darwin temporary
-  directory remains unwritable;
-- the structured result contains equal `config_immutability.sha256_before` and
-  `sha256_after` values with `unchanged=true`;
+  without `xcrun_db` denial while the surrounding Darwin temporary directory
+  remains unreadable as a subtree;
+- the structured result contains equal `configuration.before_sha256`,
+  `after_sha256`, and `loaded_sha256` values with `unchanged=true`;
 - the terminal Runner row, Windows ledger, queue/worktree counts, and registered
   checkout fingerprint agree.
 

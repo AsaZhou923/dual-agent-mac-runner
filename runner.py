@@ -456,6 +456,7 @@ class VerificationRun:
 @dataclasses.dataclass
 class RunnerConfig:
     config_path: Path
+    config_sha256: str
     app_dir: Path
     state_dir: Path
     db_path: Path
@@ -484,8 +485,8 @@ class RunnerConfig:
 
     @classmethod
     def load(cls, config_path: Path) -> "RunnerConfig":
-        config_path = config_path.expanduser().resolve()
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        config_bytes = config_path.read_bytes()
+        data = tomllib.loads(config_bytes.decode("utf-8"))
         app_dir = config_path.parent
         runner_cfg = data["runner"]
         ollama_cfg = data["ollama"]
@@ -633,6 +634,7 @@ class RunnerConfig:
                 raise RunnerError("invalid_config", "runner.owner_pubkey must be a real 64-hex owner pubkey")
         return cls(
             config_path=config_path,
+            config_sha256=sha256_hex(config_bytes),
             app_dir=app_dir,
             state_dir=Path(runner_cfg["state_dir"]).expanduser(),
             db_path=Path(runner_cfg["db_path"]).expanduser(),
@@ -2131,7 +2133,14 @@ class CodexSupervisor:
         self.worker_validator.validate(result)
         return result
 
-    def accept(self, job: dict[str, Any], worker_result: dict[str, Any], tests: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+    def accept(
+        self,
+        job: dict[str, Any],
+        worker_result: dict[str, Any],
+        tests: dict[str, Any],
+        runner_result: dict[str, Any],
+        deadline: Deadline,
+    ) -> dict[str, Any]:
         prompt = textwrap.dedent(
             f"""
             TASK: accept_result
@@ -2147,6 +2156,9 @@ class CodexSupervisor:
 
             Tests:
             {json_dumps(tests)}
+
+            Runner result:
+            {json_dumps(runner_result)}
             """
         ).strip()
         result = self._invoke_json(
@@ -2235,10 +2247,57 @@ class TestSandbox:
         self.home_dir: Path | None = None
         self.profile_path: Path | None = None
         self.xcode_derived_data: Path | None = None
+        self.temp_dir: Path | None = None
+        self.darwin_user_cache_dir: Path | None = None
+        self.system_temp_dir: Path | None = None
+
+    @staticmethod
+    def _xcode_read_roots() -> list[Path]:
+        roots = [Path("/Applications/Xcode.app")]
+        developer_dir = os.environ.get("DEVELOPER_DIR", "").strip()
+        if not developer_dir and sys.platform == "darwin" and Path("/usr/bin/xcode-select").is_file():
+            try:
+                selected = subprocess.run(
+                    ["/usr/bin/xcode-select", "-p"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                selected = None
+            if selected is not None and selected.returncode == 0:
+                developer_dir = selected.stdout.strip()
+        if developer_dir:
+            selected_path = Path(developer_dir).expanduser()
+            if selected_path.is_absolute():
+                bundle_root = next(
+                    (path for path in (selected_path, *selected_path.parents) if path.suffix == ".app"),
+                    None,
+                )
+                if bundle_root is not None and bundle_root.parent == Path("/Applications"):
+                    roots.append(bundle_root)
+        unique: dict[str, Path] = {}
+        for path in roots:
+            unique[str(path)] = path
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            unique[str(resolved)] = resolved
+        return list(unique.values())
 
     def __enter__(self) -> "TestSandbox":
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.home_dir = Path(tempfile.mkdtemp(prefix="job-home-", dir=self.base_dir))
+        self.temp_dir = self.home_dir / "tmp"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.darwin_user_cache_dir = self.home_dir / "C"
+        self.system_temp_dir = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
+        developer_tools_cache = self.darwin_user_cache_dir / "com.apple.DeveloperTools"
+        clang_cache = self.darwin_user_cache_dir / "clang"
+        developer_tools_cache.mkdir(parents=True, exist_ok=True)
+        clang_cache.mkdir(parents=True, exist_ok=True)
         self.profile_path = self.base_dir / f"{self.home_dir.name}.sb"
         xcode_rules = ""
         if self.needs_xcode_derived_data:
@@ -2253,33 +2312,26 @@ class TestSandbox:
             Path("/opt/homebrew"),
             Path("/usr/local"),
             Path("/Library"),
-            Path("/Applications/Xcode.app"),
             Path("/private/var/db/timezone"),
             Path("/private/tmp"),
             Path("/dev"),
             self.worktree,
             self.home_dir,
+            self.temp_dir,
+            self.darwin_user_cache_dir,
+            developer_tools_cache,
+            clang_cache,
         ]
+        read_roots.extend(self._xcode_read_roots())
         read_roots.extend(self._git_metadata_read_roots())
-        darwin_temp = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
-        developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
-        xcrun_db_rule = ""
-        if sys.platform == "darwin":
-            darwin_temp_text = str(darwin_temp)
-            if darwin_temp_text.startswith("/private/var/"):
-                darwin_temp_pattern = f"(/private)?{re.escape(darwin_temp_text.removeprefix('/private'))}"
-            else:
-                darwin_temp_pattern = re.escape(darwin_temp_text)
-            xcrun_db_rule = (
-                f'(allow file-read* file-write* '
-                f'(regex #"^{darwin_temp_pattern}/xcrun_db(-[^/]+)?$"))'
-            )
         if self.xcode_derived_data is not None:
+            darwin_temp = Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()
+            system_developer_tools_cache = darwin_temp.parent / "C" / "com.apple.DeveloperTools"
             read_roots.extend(
                 [
                     self.xcode_derived_data,
                     darwin_temp,
-                    developer_tools_cache,
+                    system_developer_tools_cache,
                     darwin_temp.parent / "C" / "clang",
                     Path.home() / "Library" / "Developer" / "CoreSimulator",
                     Path.home() / "Library" / "Developer" / "DVTDownloads" / "Assets" / "MetalToolchain",
@@ -2323,14 +2375,26 @@ class TestSandbox:
                     (global-name "com.apple.mobileassetd.v2"))
                 """
             ).strip()
-        read_rules = " ".join(f"(subpath {json.dumps(str(path))})" for path in read_roots)
-        write_roots = [self.worktree, self.home_dir, Path("/private/tmp")]
+        read_rules = " ".join(
+            [f"(subpath {json.dumps(str(path))})" for path in read_roots]
+            + [f"(literal {json.dumps(str(self.system_temp_dir / 'xcrun_db'))})"]
+        )
+        write_roots = [
+            self.worktree,
+            self.home_dir,
+            self.temp_dir,
+            self.darwin_user_cache_dir,
+            developer_tools_cache,
+            clang_cache,
+            self.system_temp_dir,
+            Path("/private/tmp"),
+        ]
         if self.xcode_derived_data is not None:
             write_roots.extend(
                 [
                     self.xcode_derived_data,
                     darwin_temp,
-                    developer_tools_cache,
+                    system_developer_tools_cache,
                     darwin_temp.parent / "C" / "clang",
                 ]
             )
@@ -2348,7 +2412,6 @@ class TestSandbox:
             (allow file-read-metadata)
             (allow file-read* {read_rules})
             (allow file-write* {write_rules})
-            {xcrun_db_rule}
             (deny file-write* (literal {git_marker}))
             (deny network*)
             {xcode_rules}
@@ -2402,13 +2465,12 @@ class TestSandbox:
         ]
 
     def env(self) -> dict[str, str]:
-        if self.home_dir is None:
+        if self.home_dir is None or self.temp_dir is None or self.darwin_user_cache_dir is None:
             raise RuntimeError("Sandbox not initialized")
         env = safe_subprocess_env(allow_credentials=False, home=str(self.home_dir))
-        temp_dir = self.home_dir / "tmp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
         env["CFFIXED_USER_HOME"] = str(self.home_dir)
-        env["TMPDIR"] = f"{temp_dir}/"
+        env["DARWIN_USER_CACHE_DIR"] = f"{self.darwin_user_cache_dir}/"
+        env["TMPDIR"] = f"{self.temp_dir}/"
         env["PYTHONPYCACHEPREFIX"] = str(self.home_dir / ".cache" / "python")
         return env
 
@@ -2960,7 +3022,6 @@ class Runner:
                 return self._execute_sync(job)
             if self._is_operational_job(job["payload"]):
                 return self._execute_capability(job)
-            config_sha256_before = self._config_sha256()
             deadline = Deadline(job["payload"]["deadline_seconds"])
             lease = utc_now() + min(self.config.active_lease_seconds, job["payload"]["deadline_seconds"])
             repo = self.worktrees.repo(job["payload"]["repo_id"])
@@ -2969,9 +3030,11 @@ class Runner:
             worker_result: dict[str, Any] | None = None
             tests: dict[str, Any] | None = None
             artifacts: dict[str, str] = {}
+            config_before: dict[str, str] | None = None
             try:
                 if job["status"] == "VERIFYING":
                     return self._resume_verifying(job, deadline)
+                config_before = self._configuration_fingerprint()
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"VALIDATED"}, "SUPERVISING", lease_expires=lease)
                 route = self.supervisor.decide(job, self.status(), deadline)
                 artifacts["route_decision"] = self._write_artifact(job, "route-decision", route)
@@ -2995,14 +3058,7 @@ class Runner:
                 self._assert_not_cancelled(job["job_id"], job["attempt"])
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"RUNNING"}, "VERIFYING", lease_expires=lease)
                 tests = self._run_tests(job, worktree, deadline)
-                tests = self._with_config_immutability(tests, config_sha256_before)
                 artifacts["tests"] = self._write_artifact(job, "tests", tests)
-                if not tests["config_immutability"]["unchanged"]:
-                    raise RunnerError(
-                        "config_changed_during_execution",
-                        "Runner configuration changed during job execution",
-                        details=tests["config_immutability"],
-                    )
                 if tests.get("exit_code"):
                     failing = next((item for item in tests.get("profiles", []) if item.get("exit_code")), None)
                     raise RunnerError(
@@ -3010,32 +3066,25 @@ class Runner:
                         f"Test profile {failing['profile'] if failing else 'unknown'} exited with code {tests['exit_code']}",
                         details={"tests": tests},
                     )
-                result = self._finalize(job, worktree, worker_result, tests, deadline, route=route, artifacts=artifacts)
+                assert config_before is not None
+                result = self._finalize(
+                    job,
+                    worktree,
+                    worker_result,
+                    tests,
+                    deadline,
+                    route=route,
+                    artifacts=artifacts,
+                    config_before=config_before,
+                )
                 artifacts["acceptance"] = str(self._artifact_path(job, "acceptance"))
                 artifacts["result"] = str(self._artifact_path(job, "result"))
                 result["artifacts"] = dict(sorted(artifacts.items()))
                 self.result_validator.validate(result)
                 self._write_artifact(job, "result", result)
-                tests = self._with_config_immutability(tests, config_sha256_before)
-                artifacts["tests"] = self._write_artifact(job, "tests", tests)
-                if not tests["config_immutability"]["unchanged"]:
-                    raise RunnerError(
-                        "config_changed_during_execution",
-                        "Runner configuration changed during job execution",
-                        details=tests["config_immutability"],
-                    )
-                acceptance = self.supervisor.accept(job, worker_result, tests, deadline)
+                acceptance = self.supervisor.accept(job, worker_result, tests, result, deadline)
                 artifacts["acceptance"] = self._write_artifact(job, "acceptance", acceptance)
-                tests = self._with_config_immutability(tests, config_sha256_before)
-                artifacts["tests"] = self._write_artifact(job, "tests", tests)
-                if not tests["config_immutability"]["unchanged"]:
-                    raise RunnerError(
-                        "config_changed_during_execution",
-                        "Runner configuration changed during job execution",
-                        details=tests["config_immutability"],
-                    )
                 result["supervisor"]["acceptance"] = acceptance
-                result["config_immutability"] = dict(tests["config_immutability"])
                 result["artifacts"] = dict(sorted(artifacts.items()))
                 self.result_validator.validate(result)
                 self._write_artifact(job, "result", result)
@@ -3056,7 +3105,7 @@ class Runner:
                 if (
                     current
                     and current["status"] == "VERIFYING"
-                    and exc.code not in {"verification_artifact_invalid", "config_changed_during_execution"}
+                    and exc.code != "verification_artifact_invalid"
                     and self._has_verification_artifacts(current)
                 ):
                     retry_delay = min(30, self.config.active_lease_seconds)
@@ -3085,7 +3134,6 @@ class Runner:
     def _execute_sync(self, job: dict[str, Any]) -> dict[str, Any]:
         deadline = Deadline(job["payload"]["deadline_seconds"])
         lease = utc_now() + min(self.config.active_lease_seconds, job["payload"]["deadline_seconds"])
-        config_sha256_before = self._config_sha256()
         repo = self.worktrees.repo(job["payload"]["repo_id"])
         prepared = False
         try:
@@ -3145,13 +3193,6 @@ class Runner:
                 ]
                 worker_result = {"route": "sync", "findings": findings, "errors": []}
                 tests = {"profile": SYNC_TEST_PROFILE, "exit_code": 0, "sync": outcome}
-                tests = self._with_config_immutability(tests, config_sha256_before)
-                if not tests["config_immutability"]["unchanged"]:
-                    raise RunnerError(
-                        "config_changed_during_execution",
-                        "Runner configuration changed during job execution",
-                        details=tests["config_immutability"],
-                    )
                 acceptance = {
                     "accepted": True,
                     "summary": "Configured checkout, branch, remote, target SHA, fast-forward relation, and clean final status verified.",
@@ -3177,7 +3218,6 @@ class Runner:
                     "commit_sha": outcome["after_sha"],
                     "duration_seconds": round(deadline.elapsed(), 3),
                     "errors": [],
-                    "config_immutability": dict(tests["config_immutability"]),
                     "supervisor": {"decision": route, "acceptance": acceptance},
                     "artifacts": artifacts,
                 }
@@ -3208,7 +3248,6 @@ class Runner:
         profile_route = "privileged" if payload["permission_profile"] == "privileged" else "operational"
         deadline = Deadline(payload["deadline_seconds"])
         lease = utc_now() + min(self.config.active_lease_seconds, payload["deadline_seconds"])
-        config_sha256_before = self._config_sha256()
         repo = self.worktrees.repo(payload["repo_id"])
         try:
             if job["status"] == "VALIDATED":
@@ -3217,15 +3256,8 @@ class Runner:
                 self._write_artifact(job, "route-decision", route)
                 job = self.ledger.transition(job["job_id"], job["attempt"], {"SUPERVISING"}, "PREPARING", route=profile_route, lease_expires=lease)
                 tests = self._run_capability_verification(job, repo, deadline)
-                tests = self._with_config_immutability(tests, config_sha256_before)
                 self._write_artifact(job, "tests", tests)
                 self._assert_not_cancelled(job["job_id"], job["attempt"])
-                if not tests["config_immutability"]["unchanged"]:
-                    raise RunnerError(
-                        "config_changed_during_execution",
-                        "Runner configuration changed during job execution",
-                        details=tests["config_immutability"],
-                    )
                 if tests.get("exit_code"):
                     failing = next((item for item in tests.get("profiles", []) if item.get("exit_code")), None)
                     raise RunnerError(
@@ -3248,21 +3280,6 @@ class Runner:
                 findings = worker_result["findings"]
             else:
                 raise RunnerError("invalid_state_transition", f"Cannot execute capability job from {job['status']}")
-            config_immutability = tests.get("config_immutability", {})
-            config_sha256_before = config_immutability.get("sha256_before")
-            if not isinstance(config_sha256_before, str):
-                raise RunnerError(
-                    "verification_artifact_invalid",
-                    "Capability VERIFYING artifacts are missing config immutability evidence",
-                )
-            tests = self._with_config_immutability(tests, config_sha256_before)
-            self._write_artifact(job, "tests", tests)
-            if not tests["config_immutability"]["unchanged"]:
-                raise RunnerError(
-                    "config_changed_during_execution",
-                    "Runner configuration changed during job execution",
-                    details=tests["config_immutability"],
-                )
             outcome_data = worker_result.get("outcome", {})
             acceptance = {"accepted": True, "summary": f"{capability} completed deterministically", "errors": []}
             result = {
@@ -3276,7 +3293,6 @@ class Runner:
                 "commit_sha": outcome_data.get("commit_sha"),
                 "duration_seconds": round(deadline.elapsed(), 3),
                 "errors": [],
-                "config_immutability": dict(tests["config_immutability"]),
                 "supervisor": {"decision": route, "acceptance": acceptance},
                 "artifacts": {
                     "route_decision": str(self._artifact_path(job, "route-decision")),
@@ -3547,25 +3563,6 @@ class Runner:
         worker_result = self._read_artifact(job, "worker-result")
         tests = self._read_artifact(job, "tests")
         result = self._read_artifact(job, "result")
-        config_immutability = tests.get("config_immutability", {})
-        config_sha256_before = config_immutability.get("sha256_before")
-        if isinstance(config_sha256_before, str):
-            tests = self._with_config_immutability(tests, config_sha256_before)
-            self._write_artifact(job, "tests", tests)
-            if not tests["config_immutability"]["unchanged"]:
-                error = RunnerError(
-                    "config_changed_during_execution",
-                    "Runner configuration changed during job execution",
-                    details=tests["config_immutability"],
-                )
-                return self.ledger.transition(
-                    job["job_id"],
-                    job["attempt"],
-                    {"VERIFYING"},
-                    "FAILED",
-                    error=error.as_dict(),
-                    result=result,
-                )
         try:
             self.supervisor.decision_validator.validate(route)
             self.supervisor.worker_validator.validate({"findings": worker_result.get("findings")})
@@ -3576,17 +3573,7 @@ class Runner:
             self.result_validator.validate(result)
         except RunnerError as exc:
             raise RunnerError("verification_artifact_invalid", "Saved VERIFYING artifacts failed validation") from exc
-        acceptance = self.supervisor.accept(job, worker_result, tests, deadline)
-        if isinstance(config_sha256_before, str):
-            tests = self._with_config_immutability(tests, config_sha256_before)
-            result["artifacts"]["tests"] = self._write_artifact(job, "tests", tests)
-            if not tests["config_immutability"]["unchanged"]:
-                raise RunnerError(
-                    "config_changed_during_execution",
-                    "Runner configuration changed during job execution",
-                    details=tests["config_immutability"],
-                )
-            result["config_immutability"] = dict(tests["config_immutability"])
+        acceptance = self.supervisor.accept(job, worker_result, tests, result, deadline)
         result["supervisor"]["acceptance"] = acceptance
         result["artifacts"]["acceptance"] = self._write_artifact(job, "acceptance", acceptance)
         self.result_validator.validate(result)
@@ -3601,22 +3588,6 @@ class Runner:
                 result=result,
             )
         return self.ledger.transition(job["job_id"], job["attempt"], {"VERIFYING"}, "DONE", result=result)
-
-    def _config_sha256(self) -> str:
-        try:
-            return sha256_hex(self.config.config_path.read_bytes())
-        except OSError as exc:
-            raise RunnerError("config_unreadable", "Runner configuration could not be hashed") from exc
-
-    def _with_config_immutability(self, tests: dict[str, Any], sha256_before: str) -> dict[str, Any]:
-        sha256_after = self._config_sha256()
-        materialized = dict(tests)
-        materialized["config_immutability"] = {
-            "sha256_before": sha256_before,
-            "sha256_after": sha256_after,
-            "unchanged": sha256_before == sha256_after,
-        }
-        return materialized
 
     def _select_job(self, job_id: str | None, attempt: int | None) -> dict[str, Any]:
         if job_id is not None and attempt is not None:
@@ -3768,6 +3739,17 @@ class Runner:
         }
         return tests_payload
 
+    def _configuration_fingerprint(self) -> dict[str, str]:
+        try:
+            config_bytes = self.config.config_path.read_bytes()
+        except OSError as exc:
+            raise RunnerError("config_fingerprint_unavailable", "Runner configuration file is unreadable") from exc
+        return {
+            "config_path": str(self.config.config_path),
+            "loaded_sha256": self.config.config_sha256,
+            "current_sha256": sha256_hex(config_bytes),
+        }
+
     def _finalize(
         self,
         job: dict[str, Any],
@@ -3778,10 +3760,25 @@ class Runner:
         *,
         route: dict[str, Any] | None,
         artifacts: dict[str, str],
+        config_before: dict[str, str],
     ) -> dict[str, Any]:
         payload = job["payload"]
         commit_sha: str | None = None
         repo = self.worktrees.repo(payload["repo_id"])
+        config_after = self._configuration_fingerprint()
+        configuration = {
+            "config_path": config_after["config_path"],
+            "before_sha256": config_before["current_sha256"],
+            "after_sha256": config_after["current_sha256"],
+            "loaded_sha256": config_after["loaded_sha256"],
+            "unchanged": config_before["current_sha256"] == config_after["current_sha256"] == config_after["loaded_sha256"],
+        }
+        if not configuration["unchanged"]:
+            raise RunnerError(
+                "config_changed_during_execution",
+                "Runner configuration changed while the job was executing",
+                details=configuration,
+            )
         if payload["permission_profile"] == "standard-worktree":
             changed_files, diff_bytes, diff_hash = self.worktrees.write_gate(repo, worktree, self._effective_allowed_paths(payload))
             if changed_files > self.config.max_changed_files:
@@ -3800,10 +3797,10 @@ class Runner:
             "findings": worker_result["findings"],
             "test_exit_code": tests.get("exit_code"),
             "diff_hash": diff_hash,
+            "configuration": configuration,
             "commit_sha": commit_sha,
             "duration_seconds": round(deadline.elapsed(), 3),
             "errors": list(worker_result.get("errors", [])),
-            "config_immutability": dict(tests["config_immutability"]),
             "supervisor": {
                 "decision": route or {"route": job["route"], "reason": "decision artifact missing"},
                 "acceptance": {"accepted": False, "summary": "pending", "errors": []},
