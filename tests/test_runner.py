@@ -1676,6 +1676,35 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(payload["content"], "tar")
         self.assertTrue(payload["truncated"])
 
+    def test_readonly_tool_numeric_arguments_are_clamped_to_safe_schema_bounds(self) -> None:
+        self._write_file(self.repo / "large.txt", "x" * 13000)
+        executor = runner.OrnithToolExecutor(self.repo.resolve(), runner.Deadline(10), 20000)
+        results = executor.execute(
+            [
+                {
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "large.txt", "max_chars": 50000},
+                    }
+                }
+            ]
+        )
+        payload = json.loads(results[0]["content"])
+        self.assertEqual(len(payload["content"]), 12000)
+        self.assertTrue(payload["truncated"])
+
+        with self.assertRaisesRegex(runner.RunnerError, "max_chars must be an integer"):
+            executor.execute(
+                [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "large.txt", "max_chars": True},
+                        }
+                    }
+                ]
+            )
+
     def test_readonly_tool_schema_matches_runtime_numeric_bounds(self) -> None:
         self.assertEqual(runner.DECISION_SCHEMA["properties"]["route"]["enum"], ["ornith", "codex"])
         definitions = {item["function"]["name"]: item["function"] for item in runner.READONLY_TOOL_DEFS}

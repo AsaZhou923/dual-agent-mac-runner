@@ -2019,9 +2019,7 @@ class OrnithToolExecutor:
     def _bounded_int(self, value: Any, field: str, low: int, high: int) -> int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise RunnerError("ollama_invalid_tool_calls", f"{field} must be an integer")
-        if value < low or value > high:
-            raise RunnerError("ollama_invalid_tool_calls", f"{field} must be between {low} and {high}")
-        return value
+        return min(max(value, low), high)
 
 
 class CodexSupervisor:

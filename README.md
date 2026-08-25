@@ -46,6 +46,8 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
   user-service restart.
 - Ornith tool paths are normalized only when they resolve inside the fixed task
   worktree; outside paths and symlink escapes remain fail-closed.
+- Ornith read-only numeric tool arguments are clamped to their published schema
+  bounds; booleans and non-integers remain invalid.
 - Privileged actions require an exact, recent owner approval bound to one
   deterministic action summary.
 - Credentials are removed from worker and test environments.
