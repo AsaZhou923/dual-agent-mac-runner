@@ -1,5 +1,6 @@
 [runner]
 state_dir = "~/.local/state/mac-runner"
+app_dir = "/absolute/path/to/dual-agent-mac-runner"
 db_path = "~/.local/state/mac-runner/runner.db"
 worktree_root = "~/.local/share/mac-runner/worktrees"
 artifacts_dir = "~/.local/share/mac-runner/artifacts"
@@ -34,6 +35,7 @@ push-task-branch = false
 manage-pr = false
 install-user-tool = false
 restart-user-service = false
+self-update-runner = false
 
 [repos.project_a]
 path = "/absolute/path/to/repo"
@@ -84,3 +86,12 @@ sync_enabled = false
 #
 # [capability_bindings.restart-user-service]
 # service_labels = ["com.example.buzz-acp"]
+#
+# [capability_bindings.self-update-runner]
+# repo_id = "mac-runner"
+# canonical_remote_url = "https://github.com/owner/dual-agent-mac-runner.git"
+# remote = "origin"
+# branch = "main"
+# service_label = "com.example.dual-agent-mac-runner"
+# helper_path = "/Users/name/.local/lib/mac-runner/mac-runner-self-update-helper"
+# staging_root = "~/.local/state/mac-runner/self-updates"

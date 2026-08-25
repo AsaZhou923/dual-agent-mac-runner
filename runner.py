@@ -10,12 +10,14 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import time
@@ -55,6 +57,7 @@ SECRET_ENV_KEYS = {
 }
 GIT_BIN = "/usr/bin/git"
 SYNC_TEST_PROFILE = "git-sync-verify"
+SELF_UPDATE_TEST_PROFILE = "self-update-runner"
 JOB_SCHEMA_VERSION = "mac-job/v1"
 POLICY_V2 = 2
 WIRE_PAYLOAD_MAX_BYTES = 48 * 1024
@@ -68,6 +71,7 @@ OPERATIONAL_CAPABILITIES = {
     "manage-pr",
     "install-user-tool",
     "restart-user-service",
+    "self-update-runner",
 }
 DEFAULT_ALLOWED_SERVICE_LABELS: tuple[str, ...] = ()
 DEFAULT_PROTECTED_BRANCH_PREFIXES = ("main", "master", "release/", "prod/", "production/")
@@ -428,6 +432,9 @@ class RepoConfig:
 @dataclasses.dataclass(frozen=True)
 class CapabilityConfig:
     enabled: bool
+    repo_id: str | None = None
+    canonical_remote_url: str | None = None
+    branch: str | None = None
     fixed_name: str | None = None
     fixed_source: str | None = None
     fixed_version: str | None = None
@@ -435,6 +442,8 @@ class CapabilityConfig:
     remote: str | None = None
     allowed_branch_prefixes: tuple[str, ...] = ()
     protected_branch_prefixes: tuple[str, ...] = ()
+    helper_path: Path | None = None
+    staging_root: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -606,6 +615,51 @@ class RunnerConfig:
                     enabled=bool(raw_capabilities.get(name, False)),
                     service_labels=service_labels,
                 )
+            elif name == "self-update-runner":
+                enabled = bool(raw_capabilities.get(name, False))
+                if not enabled and not binding:
+                    capability_config[name] = CapabilityConfig(enabled=False)
+                    continue
+                raw_service_label = binding.get("service_label")
+                raw_helper_path = binding.get("helper_path")
+                raw_repo_id = binding.get("repo_id")
+                raw_canonical_remote_url = binding.get("canonical_remote_url")
+                raw_remote = binding.get("remote")
+                raw_branch = binding.get("branch")
+                if not isinstance(raw_service_label, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,255}", raw_service_label):
+                    raise RunnerError(
+                        "invalid_config",
+                        "capability_bindings.self-update-runner.service_label must be a safe LaunchAgent label",
+                    )
+                if not isinstance(raw_helper_path, str) or not raw_helper_path.strip():
+                    raise RunnerError(
+                        "invalid_config",
+                        "capability_bindings.self-update-runner.helper_path is required",
+                    )
+                if not isinstance(raw_repo_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", raw_repo_id):
+                    raise RunnerError("invalid_config", "capability_bindings.self-update-runner.repo_id must be a safe fixed id")
+                if not isinstance(raw_canonical_remote_url, str) or not raw_canonical_remote_url.strip():
+                    raise RunnerError("invalid_config", "capability_bindings.self-update-runner.canonical_remote_url is required")
+                for field, value in (("remote", raw_remote), ("branch", raw_branch)):
+                    if not isinstance(value, str) or value.startswith("-") or ".." in value or not re.fullmatch(r"[A-Za-z0-9._/-]+", value):
+                        raise RunnerError("invalid_config", f"capability_bindings.self-update-runner.{field} is not a safe fixed Git name")
+                helper_path = Path(raw_helper_path).expanduser().resolve()
+                raw_staging_root = binding.get("staging_root")
+                staging_root = (
+                    Path(raw_staging_root).expanduser().resolve()
+                    if isinstance(raw_staging_root, str) and raw_staging_root.strip()
+                    else None
+                )
+                capability_config[name] = CapabilityConfig(
+                    enabled=bool(raw_capabilities.get(name, False)),
+                    repo_id=raw_repo_id,
+                    canonical_remote_url=raw_canonical_remote_url.strip(),
+                    remote=raw_remote,
+                    branch=raw_branch,
+                    service_labels=(raw_service_label,),
+                    helper_path=helper_path,
+                    staging_root=staging_root,
+                )
             elif name == "install-user-tool":
                 capability_config[name] = CapabilityConfig(
                     enabled=bool(raw_capabilities.get(name, False)),
@@ -632,6 +686,40 @@ class RunnerConfig:
         if owner_pubkey is not None:
             if owner_pubkey == "0" * 64 or not re.fullmatch(r"[0-9a-f]{64}", owner_pubkey):
                 raise RunnerError("invalid_config", "runner.owner_pubkey must be a real 64-hex owner pubkey")
+        app_dir = Path(runner_cfg.get("app_dir", config_path.parent)).expanduser().resolve()
+        self_update = capability_config.get("self-update-runner")
+        if self_update and self_update.enabled:
+            if service_label is None or self_update.service_labels != (service_label,):
+                raise RunnerError(
+                    "invalid_config",
+                    "self-update-runner must bind exactly to runner.service_label",
+                )
+            if self_update.helper_path is None or not self_update.helper_path.is_file():
+                raise RunnerError("invalid_config", "self-update-runner helper_path must be an existing file")
+            helper_metadata = self_update.helper_path.stat()
+            if helper_metadata.st_uid != os.getuid() or helper_metadata.st_mode & 0o022:
+                raise RunnerError(
+                    "invalid_config",
+                    "self-update-runner helper_path must be owned by the Runner user and not group/other writable",
+                )
+            if app_dir == self_update.helper_path.parent or app_dir in self_update.helper_path.parents:
+                raise RunnerError("invalid_config", "self-update-runner helper_path must be outside runner.app_dir")
+            if self_update.staging_root is not None and (
+                self_update.staging_root == app_dir or app_dir in self_update.staging_root.parents
+            ):
+                raise RunnerError("invalid_config", "self-update-runner staging_root must be outside runner.app_dir")
+            source_repo = repos.get(self_update.repo_id or "")
+            if source_repo is None:
+                raise RunnerError("invalid_config", "self-update-runner repo_id must identify a registered repository")
+            if (
+                source_repo.canonical_remote_url != self_update.canonical_remote_url
+                or source_repo.sync_remote != self_update.remote
+                or source_repo.sync_branch != self_update.branch
+            ):
+                raise RunnerError(
+                    "invalid_config",
+                    "self-update-runner source binding must exactly match the registered canonical remote and branch",
+                )
         return cls(
             config_path=config_path,
             config_sha256=sha256_hex(config_bytes),
@@ -989,6 +1077,19 @@ class Ledger:
             "pending": int(row["pending"] or 0),
             "retryable": int(row["retryable"] or 0),
         }
+
+    def nonterminal_jobs_except(self, job_id: str, attempt: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT job_id, attempt, status
+            FROM jobs
+            WHERE status NOT IN ('DONE', 'FAILED', 'REJECTED', 'CANCELLED')
+              AND NOT (job_id = ? AND attempt = ?)
+            ORDER BY created_at ASC
+            """,
+            (job_id, attempt),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 class FileLock:
@@ -2794,6 +2895,18 @@ class Runner:
             parts.append(f"tool={binding.fixed_name}")
         if capability in {"push-task-branch", "manage-pr"}:
             parts.append(f"branch=job/{payload['job_id']}")
+        if capability == "self-update-runner":
+            service = binding.service_labels[0] if len(binding.service_labels) == 1 else ""
+            parts.extend(
+                [
+                    f"base={payload['base_sha']}",
+                    f"target={payload['target_sha']}",
+                    f"service={service}",
+                    f"url={binding.canonical_remote_url or ''}",
+                    f"remote={binding.remote or ''}",
+                    f"branch={binding.branch or ''}",
+                ]
+            )
         return ";".join(parts)
 
     def _validate_policy_constraints(self, payload: dict[str, Any]) -> None:
@@ -2822,7 +2935,7 @@ class Runner:
                 raise RunnerError("capability_field_conflict", "required_capabilities may not be used as execution authorization")
             if capability in {"prepare-registered-repo", "restart-user-service"} and network["mode"] != "none":
                 raise RunnerError("network_not_allowed", f"{capability} must use network.mode=none")
-            if capability in {"sync-registered-repo", "push-task-branch", "manage-pr", "install-user-tool"} and network["mode"] != "declared-remotes-and-registries":
+            if capability in {"sync-registered-repo", "push-task-branch", "manage-pr", "install-user-tool", "self-update-runner"} and network["mode"] != "declared-remotes-and-registries":
                 raise RunnerError("network_not_allowed", f"{capability} requires network.mode=declared-remotes-and-registries")
             if permission_profile == "privileged":
                 self._assert_owner_approval(payload, capability)
@@ -2895,6 +3008,19 @@ class Runner:
             self.worktrees.assert_exact_commit(repo, payload["base_sha"], network_mode="none")
             self.worktrees.assert_no_sensitive_paths(repo, payload["base_sha"], network_mode="none")
             return
+        if payload.get("capabilities") == ["self-update-runner"]:
+            self.sync.assert_configured(repo)
+            if payload["permission_profile"] != "privileged":
+                raise RunnerError("permission_profile_required", "self-update-runner requires permission_profile=privileged")
+            if payload["task_type"] != "self-update":
+                raise RunnerError("task_type_mismatch", "self-update-runner requires task_type=self-update")
+            if self._effective_allowed_paths(payload) != ["."]:
+                raise RunnerError("self_update_scope_invalid", "self-update-runner must target only the registered repository root")
+            if self._effective_verification_profiles(payload) != [SELF_UPDATE_TEST_PROFILE]:
+                raise RunnerError("self_update_profile_required", f"self-update-runner must use only {SELF_UPDATE_TEST_PROFILE}")
+            self.worktrees.assert_exact_commit(repo, payload["target_sha"], network_mode=payload.get("network", {}).get("mode", "none"))
+            self.worktrees.assert_no_sensitive_paths(repo, payload["target_sha"], network_mode=payload.get("network", {}).get("mode", "none"))
+            return
         network_mode = payload.get("network", {}).get("mode", "none")
         self.worktrees.assert_exact_commit(repo, payload["base_sha"], network_mode=network_mode)
         self.worktrees.assert_exact_commit(repo, payload["target_sha"], network_mode=network_mode)
@@ -2954,6 +3080,12 @@ class Runner:
 
     def status(self) -> dict[str, Any]:
         task_types = self.job_validator.schema["properties"]["task_type"]["enum"]
+        self_update_binding = self.config.capability_config.get("self-update-runner", CapabilityConfig(enabled=False))
+        source_marker_path = self.config.app_dir / ".source-commit"
+        try:
+            source_marker = source_marker_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            source_marker = None
         repos = {
             repo_id: {
                 "path": str(repo.path),
@@ -2979,7 +3111,28 @@ class Runner:
             "ollama": self.ollama.status(timeout=5),
             "queue": self.ledger.queue_counts(),
             "git": {"worktrees": len(list(self.config.worktree_root.glob("*/*"))), "dirty_outside_jobs": False},
-            "runner": {"write_enabled": self.config.supervisor_allow_write_tasks, "task_types": task_types},
+            "runner": {
+                "write_enabled": self.config.supervisor_allow_write_tasks,
+                "task_types": task_types,
+                "self_update": {
+                    "enabled": bool(self_update_binding.enabled),
+                    "service_label": self_update_binding.service_labels[0] if self_update_binding.service_labels else None,
+                    "helper_path": str(self_update_binding.helper_path) if self_update_binding.helper_path else None,
+                    "source_marker": source_marker,
+                    "source_repo_id": self_update_binding.repo_id,
+                    "canonical_remote_url": self_update_binding.canonical_remote_url,
+                    "remote": self_update_binding.remote,
+                    "branch": self_update_binding.branch,
+                    "ready": bool(
+                        self_update_binding.enabled
+                        and self_update_binding.helper_path
+                        and self_update_binding.helper_path.is_file()
+                        and self_update_binding.service_labels == ((self.config.service_label or ""),)
+                        and isinstance(source_marker, str)
+                        and re.fullmatch(r"[0-9a-f]{40}", source_marker)
+                    ),
+                },
+            },
             "repos": repos,
         }
 
@@ -3025,6 +3178,8 @@ class Runner:
                 return job
             if self._is_sync_capability_job(job["payload"]):
                 return self._execute_sync(job)
+            if job["payload"].get("capabilities") == ["self-update-runner"]:
+                return self._execute_self_update(job)
             if self._is_operational_job(job["payload"]):
                 return self._execute_capability(job)
             deadline = Deadline(job["payload"]["deadline_seconds"])
@@ -3324,6 +3479,573 @@ class Runner:
                     error=exc.as_dict(),
                 )
             raise
+
+    def _execute_self_update(self, job: dict[str, Any]) -> dict[str, Any]:
+        payload = job["payload"]
+        deadline = Deadline(payload["deadline_seconds"])
+        lease = utc_now() + min(self.config.active_lease_seconds, payload["deadline_seconds"])
+        repo = self.worktrees.repo(payload["repo_id"])
+        route = {"route": "privileged", "reason": "Deterministic self-update-runner handoff"}
+        try:
+            if job["status"] == "VALIDATED":
+                job = self.ledger.transition(
+                    job["job_id"],
+                    job["attempt"],
+                    {"VALIDATED"},
+                    "SUPERVISING",
+                    route="privileged",
+                    note=route,
+                    lease_expires=lease,
+                )
+                self._write_artifact(job, "route-decision", route)
+                job = self.ledger.transition(job["job_id"], job["attempt"], {"SUPERVISING"}, "PREPARING", route="privileged", lease_expires=lease)
+                preflight = self._self_update_preflight(repo, payload, deadline)
+                if preflight["noop"]:
+                    worker_result = {
+                        "route": "privileged",
+                        "findings": [
+                            {
+                                "severity": "info",
+                                "title": "Runner already at requested source",
+                                "detail": f"{payload['repo_id']} source marker already matches {payload['target_sha']}.",
+                            }
+                        ],
+                        "errors": [],
+                        "outcome": preflight,
+                    }
+                    tests = {"profile": SELF_UPDATE_TEST_PROFILE, "exit_code": 0, "self_update": preflight}
+                    self._write_artifact(job, "worker-result", worker_result)
+                    self._write_artifact(job, "tests", tests)
+                    job = self.ledger.transition(job["job_id"], job["attempt"], {"PREPARING"}, "RUNNING", route="privileged", note={"capability": "self-update-runner"}, lease_expires=lease)
+                    job = self.ledger.transition(job["job_id"], job["attempt"], {"RUNNING"}, "VERIFYING", route="privileged", lease_expires=lease)
+                    return self._finish_self_update(job, worker_result, tests, deadline, route)
+                tests = self._validate_self_update_candidate(job, repo, preflight, deadline)
+                self._write_artifact(job, "tests", tests)
+                if tests.get("exit_code"):
+                    failing = next((item for item in tests.get("profiles", []) if item.get("exit_code")), None)
+                    raise RunnerError(
+                        "test_profile_failed",
+                        f"Test profile {failing['profile'] if failing else 'unknown'} exited with code {tests['exit_code']}",
+                        details={"tests": tests},
+                    )
+                self._assert_not_cancelled(job["job_id"], job["attempt"])
+                job = self.ledger.transition(job["job_id"], job["attempt"], {"PREPARING"}, "RUNNING", route="privileged", note={"capability": "self-update-runner"}, lease_expires=lease)
+                outcome = self._start_self_update_helper(job, preflight, deadline)
+                worker_result = {
+                    "route": "privileged",
+                    "findings": [
+                        {
+                            "severity": "info",
+                            "title": "Runner self-update staged",
+                            "detail": (
+                                f"Validated candidate {payload['target_sha']} and launched the fixed helper "
+                                f"for {outcome['service_label']}."
+                            ),
+                        }
+                    ],
+                    "errors": [],
+                    "outcome": outcome,
+                }
+                self._write_artifact(job, "worker-result", worker_result)
+                job = self.ledger.transition(
+                    job["job_id"],
+                    job["attempt"],
+                    {"RUNNING"},
+                    "VERIFYING",
+                    route="privileged",
+                    note={"phase": "helper_started", "plan": outcome["plan_path"]},
+                    lease_expires=utc_now() + min(30, self.config.active_lease_seconds),
+                )
+                try:
+                    self._launch_self_update_helper(outcome)
+                except OSError as exc:
+                    return self.ledger.transition(
+                        job["job_id"],
+                        job["attempt"],
+                        {"VERIFYING"},
+                        "FAILED",
+                        error=RunnerError("self_update_helper_start_failed", "Could not launch the fixed self-update helper").as_dict(),
+                    )
+                return job
+            if job["status"] == "VERIFYING":
+                worker_result = self._read_artifact(job, "worker-result")
+                tests = self._read_artifact(job, "tests")
+                route = self._read_artifact(job, "route-decision")
+                return self._finish_self_update(job, worker_result, tests, deadline, route)
+            raise RunnerError("invalid_state_transition", f"Cannot execute self-update-runner job from {job['status']}")
+        except RunnerError as exc:
+            current = self.ledger.get_job(job["job_id"], job["attempt"])
+            if current and current["status"] in TERMINAL_STATES:
+                return current
+            if current:
+                return self.ledger.transition(
+                    current["job_id"],
+                    current["attempt"],
+                    set(STATE_SEQUENCE) - TERMINAL_STATES,
+                    "FAILED" if current["status"] != "RECEIVED" else "REJECTED",
+                    error=exc.as_dict(),
+                )
+            raise
+
+    def _self_update_preflight(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
+        binding = self._require_capability_enabled("self-update-runner")
+        self._assert_self_update_quiescent(payload)
+        if (
+            payload["repo_id"] != binding.repo_id
+            or repo.repo_id != binding.repo_id
+            or repo.canonical_remote_url != binding.canonical_remote_url
+            or repo.sync_remote != binding.remote
+            or repo.sync_branch != binding.branch
+        ):
+            raise RunnerError("self_update_source_mismatch", "self-update job does not match the fixed source repository binding")
+        if len(binding.service_labels) != 1 or binding.service_labels[0] != self.config.service_label:
+            raise RunnerError("capability_not_configured", "self-update-runner must bind exactly to runner.service_label")
+        if binding.helper_path is None:
+            raise RunnerError("capability_not_configured", "self-update-runner requires a fixed helper_path")
+        if not binding.helper_path.is_file():
+            raise RunnerError("capability_not_configured", "self-update-runner helper_path is unavailable")
+        marker_path = self.config.app_dir / ".source-commit"
+        try:
+            current_marker = marker_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RunnerError("self_update_marker_missing", "Runner .source-commit marker is unreadable") from exc
+        if current_marker != payload["base_sha"]:
+            raise RunnerError(
+                "base_mismatch",
+                "Runner .source-commit marker does not match the requested base_sha",
+                details={"expected": payload["base_sha"], "actual": current_marker},
+            )
+        sync_snapshot = self._self_update_fixed_remote_preflight(repo, payload, deadline)
+        service_label = binding.service_labels[0]
+        uid = str(os.getuid())
+        before = run_command(["launchctl", "print", f"gui/{uid}/{service_label}"], env=safe_subprocess_env(), timeout=deadline.remaining(20), check=False)
+        before_pid = self._launchctl_pid(before.stdout)
+        if before.returncode != 0 or before_pid is None:
+            raise RunnerError("service_not_running", f"launchctl did not report a running PID for {service_label} before self-update")
+        runtime_path = Path(sys.executable).resolve()
+        return {
+            "repo_id": repo.repo_id,
+            "base_sha": payload["base_sha"],
+            "target_sha": payload["target_sha"],
+            "remote": repo.sync_remote,
+            "branch": repo.sync_branch,
+            "remote_head": sync_snapshot["remote_head"],
+            "service_label": service_label,
+            "before_pid": before_pid,
+            "config_path": str(self.config.config_path),
+            "config_sha256": self.config.config_sha256,
+            "db_path": str(self.config.db_path),
+            "app_dir": str(self.config.app_dir),
+            "helper_path": str(binding.helper_path),
+            "helper_sha256": sha256_hex(binding.helper_path.read_bytes()),
+            "runtime_path": str(runtime_path),
+            "runtime_sha256": sha256_hex(runtime_path.read_bytes()),
+            "runtime_version": platform.python_version(),
+            "noop": payload["base_sha"] == payload["target_sha"],
+        }
+
+    def _assert_self_update_quiescent(self, payload: dict[str, Any]) -> None:
+        other_jobs = self.ledger.nonterminal_jobs_except(payload["job_id"], int(payload["attempt"]))
+        if other_jobs:
+            raise RunnerError(
+                "runner_not_quiescent",
+                "Runner self-update requires an empty queue except for the current job",
+                details={"jobs": other_jobs[:16]},
+            )
+        if self.config.worktree_root.exists():
+            worktrees = [path for path in self.config.worktree_root.glob("*/*") if path.is_dir()]
+            if worktrees:
+                raise RunnerError(
+                    "runner_not_quiescent",
+                    "Runner self-update refuses to start while task worktrees are present",
+                    details={"worktree_count": len(worktrees)},
+                )
+
+    def _self_update_fixed_remote_preflight(
+        self,
+        repo: RepoConfig,
+        payload: dict[str, Any],
+        deadline: Deadline,
+    ) -> dict[str, Any]:
+        self.sync.assert_configured(repo)
+        if not repo.path.is_dir():
+            raise RunnerError("not_git_checkout", f"Configured checkout for {repo.repo_id} does not exist")
+        inside = self.sync._git(repo, ["rev-parse", "--is-inside-work-tree"], deadline, check=False)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            raise RunnerError("not_git_checkout", f"Configured path for {repo.repo_id} is not a Git worktree")
+        top = Path(self.sync._git(repo, ["rev-parse", "--show-toplevel"], deadline).stdout.strip()).resolve()
+        if top != repo.path:
+            raise RunnerError("wrong_checkout", f"Configured path for {repo.repo_id} is not the worktree top level")
+        remote_urls = self.sync._git(repo, ["remote", "get-url", "--all", repo.sync_remote or ""], deadline, check=False)
+        urls = [line for line in remote_urls.stdout.splitlines() if line]
+        if remote_urls.returncode != 0 or urls != [repo.canonical_remote_url]:
+            raise RunnerError("wrong_remote", f"Configured remote for {repo.repo_id} does not match its canonical allowlist URL")
+        branch = self.sync._git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], deadline, check=False)
+        if branch.returncode != 0 or branch.stdout.strip() != repo.sync_branch:
+            raise RunnerError(
+                "wrong_branch",
+                f"Repository {repo.repo_id} is not on its configured self-update branch",
+                details={"expected": repo.sync_branch},
+            )
+        status = self.sync._git(repo, ["status", "--porcelain=v1", "--untracked-files=all"], deadline)
+        if status.stdout.splitlines():
+            raise RunnerError(
+                "dirty_worktree",
+                f"Repository {repo.repo_id} has tracked or untracked changes",
+                details={"entry_count": len(status.stdout.splitlines())},
+            )
+        self.sync._fetch(repo, deadline)
+        remote_head = self.sync._remote_head(repo, deadline)
+        if remote_head != payload["target_sha"]:
+            raise RunnerError(
+                "target_mismatch",
+                "Configured remote branch does not match the requested immutable self-update target SHA",
+                details={"expected": payload["target_sha"], "actual": remote_head},
+            )
+        self.sync._rev_parse(repo, payload["base_sha"], deadline)
+        self.sync._rev_parse(repo, payload["target_sha"], deadline)
+        self.sync._assert_ancestor(repo, payload["base_sha"], payload["target_sha"], deadline)
+        return {"remote_head": remote_head, "branch": repo.sync_branch, "status": []}
+
+    def _self_update_staging_root(self) -> Path:
+        binding = self._require_capability_enabled("self-update-runner")
+        return binding.staging_root or (self.config.state_dir / "self-updates")
+
+    def _validate_self_update_candidate(
+        self,
+        job: dict[str, Any],
+        repo: RepoConfig,
+        preflight: dict[str, Any],
+        deadline: Deadline,
+    ) -> dict[str, Any]:
+        _ = repo
+        validation_dir = self._materialize_self_update_candidate(job, preflight, deadline, leaf="candidate-validation", write_plan=False)
+        profile = self.profiles.load(SELF_UPDATE_TEST_PROFILE)
+        env = safe_subprocess_env()
+        env["MAC_RUNNER_SELF_UPDATE_CANDIDATE"] = str(validation_dir)
+        migration_db = validation_dir.parent / "migration-runner.db"
+        if migration_db.exists():
+            migration_db.unlink()
+        migration_connection = sqlite3.connect(migration_db)
+        try:
+            self.ledger.conn.backup(migration_connection)
+        finally:
+            migration_connection.close()
+        os.chmod(migration_db, 0o600)
+        env["MAC_RUNNER_SELF_UPDATE_DB_COPY"] = str(migration_db)
+        proc = run_command(profile.command, cwd=validation_dir, env=env, timeout=deadline.remaining(profile.timeout_seconds), check=False)
+        for key in SECRET_ENV_KEYS:
+            if key in env:
+                raise RunnerError("secret_env_leak", f"Secret env leaked into self-update verification: {key}")
+        candidate_dir: Path | None = None
+        if proc.returncode == 0:
+            candidate_dir = self._materialize_self_update_candidate(job, preflight, deadline, leaf="candidate", write_plan=True)
+        result = {
+            "profile": SELF_UPDATE_TEST_PROFILE,
+            "profiles": [
+                {
+                    "profile": SELF_UPDATE_TEST_PROFILE,
+                    "exit_code": proc.returncode,
+                    "stdout": trim_text(proc.stdout or "", 4000),
+                    "stderr": trim_text(proc.stderr or "", 4000),
+                }
+            ],
+            "exit_code": proc.returncode,
+            "validation_candidate_dir": str(validation_dir),
+            "candidate_dir": str(candidate_dir) if candidate_dir is not None else None,
+        }
+        return result
+
+    def _materialize_self_update_candidate(
+        self,
+        job: dict[str, Any],
+        preflight: dict[str, Any],
+        deadline: Deadline,
+        *,
+        leaf: str,
+        write_plan: bool,
+    ) -> Path:
+        payload = job["payload"]
+        staging_root = self._self_update_staging_root().resolve()
+        if leaf not in {"candidate", "candidate-validation"}:
+            raise RunnerError("artifact_path_escape", "Invalid self-update candidate leaf")
+        candidate_dir = (staging_root / payload["job_id"] / str(payload["attempt"]) / leaf).resolve()
+        if staging_root != candidate_dir and staging_root not in candidate_dir.parents:
+            raise RunnerError("artifact_path_escape", "Self-update candidate escaped staging root")
+        if candidate_dir.exists():
+            shutil.rmtree(candidate_dir)
+        candidate_dir.mkdir(parents=True, exist_ok=False)
+        env = safe_subprocess_env()
+        try:
+            archive = subprocess.run(
+                [GIT_BIN, "-C", str(self.worktrees.repo(payload["repo_id"]).path), "archive", "--format=tar", payload["target_sha"]],
+                env=env,
+                capture_output=True,
+                text=False,
+                timeout=deadline.remaining(60),
+                check=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError("subprocess_timeout", "git archive timed out while materializing self-update candidate") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RunnerError(
+                "subprocess_failed",
+                "git archive failed while materializing self-update candidate",
+                details={"returncode": exc.returncode, "stderr": trim_text(exc.stderr.decode("utf-8", "replace"), 4000)},
+            ) from exc
+        with tempfile.NamedTemporaryFile("wb", dir=candidate_dir.parent, delete=False) as handle:
+            handle.write(archive.stdout)
+            tar_path = Path(handle.name)
+        try:
+            with tarfile.open(tar_path, "r:") as tar:
+                members = tar.getmembers()
+                for member in members:
+                    member_path = Path(member.name)
+                    if member.name.startswith("/") or ".." in member_path.parts or member.name in {"", "."}:
+                        raise RunnerError("path_escape", f"Unsafe path in self-update archive: {member.name}")
+                    if not (member.isfile() or member.isdir()):
+                        raise RunnerError("path_escape", f"Unsafe file type in self-update archive: {member.name}")
+                    destination = (candidate_dir / member.name).resolve()
+                    if destination != candidate_dir and candidate_dir not in destination.parents:
+                        raise RunnerError("path_escape", f"Archive member escaped candidate directory: {member.name}")
+                tar.extractall(candidate_dir, members=members, filter="data")
+        finally:
+            tar_path.unlink(missing_ok=True)
+        (candidate_dir / ".source-commit").write_text(f"{payload['target_sha']}\n", encoding="utf-8")
+        if not (candidate_dir / "runner.py").is_file():
+            raise RunnerError("self_update_candidate_invalid", "Self-update candidate does not contain runner.py")
+        if write_plan:
+            manifest = {
+                "schema": "mac-runner/self-update-candidate-v1",
+                "job_id": payload["job_id"],
+                "attempt": payload["attempt"],
+                "base_sha": payload["base_sha"],
+                "target_sha": payload["target_sha"],
+                "candidate_dir": str(candidate_dir),
+                "candidate_sha256": self._tree_sha256(candidate_dir),
+                "preflight": preflight,
+            }
+            self._write_artifact(job, "self-update-plan", manifest)
+        return candidate_dir
+
+    def _start_self_update_helper(
+        self,
+        job: dict[str, Any],
+        preflight: dict[str, Any],
+        deadline: Deadline,
+    ) -> dict[str, Any]:
+        tests = self._read_artifact(job, "tests")
+        staged_plan = self._read_artifact(job, "self-update-plan")
+        if not isinstance(tests.get("candidate_dir"), str):
+            raise RunnerError("self_update_candidate_missing", "Self-update deploy candidate was not materialized")
+        candidate_dir = Path(str(tests.get("candidate_dir", ""))).resolve()
+        if not candidate_dir.is_dir():
+            raise RunnerError("self_update_candidate_missing", "Validated self-update candidate directory is unavailable")
+        payload = job["payload"]
+        staging_root = self._self_update_staging_root().resolve()
+        plan_dir = (staging_root / payload["job_id"] / str(payload["attempt"])).resolve()
+        result_path = plan_dir / "helper-result.json"
+        backup_dir = plan_dir / "rollback-app"
+        db_backup_dir = plan_dir / "rollback-db"
+        plan_path = plan_dir / "plan.json"
+        if self.config.app_dir.stat().st_dev != plan_dir.stat().st_dev:
+            raise RunnerError(
+                "self_update_cross_device",
+                "self-update app_dir and staging_root must be on the same filesystem for atomic rename",
+            )
+        plan = {
+            "schema": "mac-runner/self-update-plan-v1",
+            "job_id": payload["job_id"],
+            "attempt": payload["attempt"],
+            "base_sha": payload["base_sha"],
+            "target_sha": payload["target_sha"],
+            "app_dir": str(self.config.app_dir),
+            "candidate_dir": str(candidate_dir),
+            "candidate_sha256": staged_plan["candidate_sha256"],
+            "backup_dir": str(backup_dir),
+            "db_backup_dir": str(db_backup_dir),
+            "config_path": str(self.config.config_path),
+            "config_sha256": self.config.config_sha256,
+            "db_path": str(self.config.db_path),
+            "result_path": str(result_path),
+            "service_label": preflight["service_label"],
+            "before_pid": preflight["before_pid"],
+            "source_marker": str(self.config.app_dir / ".source-commit"),
+            "helper_sha256": preflight["helper_sha256"],
+            "runtime_path": preflight["runtime_path"],
+            "runtime_sha256": preflight["runtime_sha256"],
+            "runtime_version": preflight["runtime_version"],
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        ensure_parent(plan_path)
+        plan_path.write_text(json.dumps(plan, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.chmod(plan_path, 0o600)
+        return {
+            "status": "helper_started",
+            "plan_path": str(plan_path),
+            "result_path": str(result_path),
+            "candidate_dir": str(candidate_dir),
+            "service_label": preflight["service_label"],
+            "before_pid": preflight["before_pid"],
+            "commit_sha": payload["target_sha"],
+            "helper_path": preflight["helper_path"],
+            "runtime_path": preflight["runtime_path"],
+            "runtime_sha256": preflight["runtime_sha256"],
+            "runtime_version": preflight["runtime_version"],
+        }
+
+    def _launch_self_update_helper(self, outcome: dict[str, Any]) -> None:
+        helper_path = Path(str(outcome["helper_path"]))
+        plan_path = Path(str(outcome["plan_path"]))
+        subprocess.Popen(
+            [sys.executable, str(helper_path), str(plan_path)],
+            cwd="/",
+            env=safe_subprocess_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _finish_self_update(
+        self,
+        job: dict[str, Any],
+        worker_result: dict[str, Any],
+        tests: dict[str, Any],
+        deadline: Deadline,
+        route: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = job["payload"]
+        outcome_data = dict(worker_result.get("outcome") or {})
+        if outcome_data.get("noop"):
+            helper_result = {"status": "succeeded", "noop": True, "target_sha": payload["target_sha"]}
+        else:
+            result_path = Path(str(outcome_data.get("result_path", ""))).resolve()
+            staging_root = self._self_update_staging_root().resolve()
+            if staging_root not in result_path.parents or result_path.name != "helper-result.json":
+                raise RunnerError("self_update_result_invalid", "Self-update helper result path escaped the fixed staging root")
+            if not result_path.is_file():
+                started_at = job.get("started_at")
+                if isinstance(started_at, (int, float)) and utc_now() - float(started_at) >= payload["deadline_seconds"]:
+                    raise RunnerError("self_update_helper_timeout", "Self-update helper did not finish before the job deadline")
+                retry_delay = min(30, self.config.active_lease_seconds)
+                return self.ledger.transition(
+                    job["job_id"],
+                    job["attempt"],
+                    {"VERIFYING"},
+                    "VERIFYING",
+                    note={"retry": "self_update_helper_result_pending"},
+                    lease_expires=utc_now() + retry_delay,
+                )
+            try:
+                helper_result = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RunnerError("self_update_result_invalid", "Self-update helper result is unreadable") from exc
+            if not isinstance(helper_result, dict) or helper_result.get("schema") != "mac-runner/self-update-result-v1":
+                raise RunnerError("self_update_result_invalid", "Self-update helper result schema is invalid")
+            self._validate_self_update_helper_success(payload, outcome_data, helper_result)
+        succeeded = helper_result.get("status") == "succeeded"
+        final_status = "DONE" if succeeded else "FAILED"
+        findings = list(worker_result.get("findings") or [])
+        if not findings:
+            findings = [{"severity": "info", "title": "Runner self-update", "detail": "Self-update helper completed."}]
+        acceptance = {
+            "accepted": bool(succeeded),
+            "summary": "Self-update helper verified postconditions." if succeeded else "Self-update helper reported failure.",
+            "errors": [] if succeeded else [str(helper_result.get("error", "helper failed"))],
+        }
+        result = {
+            "job_id": payload["job_id"],
+            "attempt": payload["attempt"],
+            "status": final_status,
+            "route": "privileged",
+            "findings": findings,
+            "test_exit_code": tests.get("exit_code"),
+            "diff_hash": sha256_hex(canonical_json_bytes(helper_result)),
+            "commit_sha": payload["target_sha"] if succeeded else None,
+            "duration_seconds": round(deadline.elapsed(), 3),
+            "errors": [] if succeeded else acceptance["errors"],
+            "supervisor": {"decision": route, "acceptance": acceptance},
+            "artifacts": {
+                "route_decision": str(self._artifact_path(job, "route-decision")),
+                "worker_result": str(self._artifact_path(job, "worker-result")),
+                "tests": str(self._artifact_path(job, "tests")),
+                "acceptance": str(self._artifact_path(job, "acceptance")),
+                "result": str(self._artifact_path(job, "result")),
+            },
+        }
+        self.result_validator.validate(result)
+        self._write_artifact(job, "acceptance", acceptance)
+        self._write_artifact(job, "result", result)
+        if succeeded:
+            return self.ledger.transition(job["job_id"], job["attempt"], {"VERIFYING"}, "DONE", result=result)
+        return self.ledger.transition(
+            job["job_id"],
+            job["attempt"],
+            {"VERIFYING"},
+            "FAILED",
+            error=RunnerError("self_update_failed", "Self-update helper reported failure", details=helper_result).as_dict(),
+            result=result,
+        )
+
+    def _validate_self_update_helper_success(
+        self,
+        payload: dict[str, Any],
+        outcome_data: dict[str, Any],
+        helper_result: dict[str, Any],
+    ) -> None:
+        if helper_result.get("status") != "succeeded":
+            return
+        expected = {
+            "target_sha": payload["target_sha"],
+            "service_label": outcome_data.get("service_label"),
+            "before_pid": outcome_data.get("before_pid"),
+            "config_sha256": self.config.config_sha256,
+            "sqlite_integrity": "ok",
+            "runner_status": "ok",
+            "source_marker": payload["target_sha"],
+            "process_verified": True,
+            "job_status": "VERIFYING",
+            "runtime_path": outcome_data.get("runtime_path"),
+            "runtime_sha256": outcome_data.get("runtime_sha256"),
+            "runtime_version": outcome_data.get("runtime_version"),
+        }
+        mismatches = {
+            key: {"expected": value, "actual": helper_result.get(key)}
+            for key, value in expected.items()
+            if helper_result.get(key) != value
+        }
+        after_pid = helper_result.get("after_pid")
+        if not isinstance(after_pid, int) or after_pid <= 0 or after_pid == outcome_data.get("before_pid"):
+            mismatches["after_pid"] = {"expected": "positive new PID", "actual": after_pid}
+        queue = helper_result.get("queue")
+        if not isinstance(queue, dict) or queue.get("pending") != 0 or queue.get("running") != 1 or queue.get("worktrees") != 0:
+            mismatches["queue"] = {
+                "expected": {"pending": 0, "running": 1, "worktrees": 0},
+                "actual": queue,
+            }
+        if mismatches:
+            raise RunnerError(
+                "self_update_result_invalid",
+                "Self-update helper success result did not match the staged deterministic plan",
+                details={"fields": mismatches},
+            )
+
+    def _tree_sha256(self, root: Path) -> str:
+        digest = hashlib.sha256()
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            filenames.sort()
+            current = Path(current_root)
+            for filename in filenames:
+                path = current / filename
+                relative = str(path.relative_to(root))
+                mode = path.stat().st_mode & 0o777
+                digest.update(relative.encode("utf-8") + b"\0" + f"{mode:o}".encode("ascii") + b"\0")
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        return digest.hexdigest()
 
     def _run_capability_verification(self, job: dict[str, Any], repo: RepoConfig, deadline: Deadline) -> dict[str, Any]:
         profiles = self._effective_verification_profiles(job["payload"])

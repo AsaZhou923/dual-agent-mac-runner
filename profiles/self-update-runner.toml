@@ -1,0 +1,3 @@
+command = ["python3", "scripts/validate-self-update-candidate"]
+timeout_seconds = 900
+description = "Validate a materialized Mac Runner self-update candidate before the external one-shot helper swaps the app."

@@ -43,7 +43,8 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
 - Operational actions use fixed capability handlers for reversible
   registered-repository preparation, registered-repository sync, task-branch
   push, PR management, fixed user-tool installation, and configured
-  user-service restart.
+  user-service restart. Privileged self-update uses an external one-shot helper
+  and resumes from `VERIFYING` after the service restarts.
 - Ornith tool paths are normalized only when they resolve inside the fixed task
   worktree; outside paths and symlink escapes remain fail-closed.
 - Ornith read-only numeric tool arguments are clamped to their published schema
@@ -60,6 +61,8 @@ four permission profiles: `observe`, `standard-worktree`, `operational`, and
 - `schemas/` — job and result contracts.
 - `profiles/` — production-safe generic profiles.
 - `examples/` — synthetic configuration and one synthetic profile example.
+- `scripts/` — CLI wrapper plus the external self-update helper to install
+  outside the app directory before enabling privileged Runner self-update.
 - `launchd/` — parameterized LaunchAgent template.
 - `integrations/codex/` — Mac Codex Supervisor and Buzz ACP integration.
 - `agents/ornith/` — trackable Ollama model declaration; never model weights.

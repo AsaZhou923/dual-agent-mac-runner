@@ -63,14 +63,55 @@ return the stored attempt without adding another job or event.
   manifest, repairs only the fixed remote URL, and rolls back on failure.
 - `sync-registered-repo` requires the reserved `git-sync-verify` profile and a
   clean registered checkout on the configured branch and canonical remote.
+- `self-update-runner` is privileged, default-disabled, and requires the
+  reserved `self-update-runner` profile, a configured owner pubkey, the fixed
+  Runner LaunchAgent label, an external one-shot helper path, and a registered
+  checkout whose repo id, canonical URL, remote name, and branch exactly match
+  the separate capability binding. The current app `.source-commit` must
+  equal `base_sha`; the fetched fixed branch must equal `target_sha`; and
+  `target_sha` must be a fast-forward descendant of `base_sha` unless the
+  request is a deterministic no-op. The candidate is materialized from Git
+  archive blobs, rejects unsafe paths/symlinks/special files, preserves config,
+  and leaves the job in `VERIFYING` until the restarted Runner reads the helper
+  result.
 - Keep `permission_mode=default`. Do not enable `bypassPermissions` until the
   Runner-only side-effect tool surface and network boundary have independent
   end-to-end evidence.
 - Generic lockfile dependency acquisition is not implemented by this release;
   verification commands remain no-network and credential-free.
-- Runner self-restart is fail-closed until a one-shot helper can verify the new
-  process after the current Runner exits. Set `runner.service_label` to the
-  installed Runner LaunchAgent label so this boundary is enforced.
+- Install the self-update helper outside `runner.app_dir` during bootstrap.
+  The helper swaps app directories, restarts only the fixed LaunchAgent,
+  verifies new PID, source marker, config hash, SQLite integrity, and writes a
+  bounded result. On failure it attempts to restore the previous app and its
+  consistent SQLite backup before reporting `FAILED`. Keep `staging_root` on
+  the same filesystem as `runner.app_dir`; cross-device self-update is rejected
+  before mutation.
+
+### First self-update bootstrap
+
+The deployed Runner cannot authorize a capability it does not yet contain. The
+first installation therefore remains a reviewed manual deployment:
+
+1. Deploy one exact reviewed Mac Runner commit and run the complete macOS test
+   suite before enabling the capability.
+2. Copy `scripts/mac-runner-self-update-helper` to the fixed external
+   `helper_path`, owned by the Runner user with mode `0700` or `0755` and no
+   group/other write bit.
+3. Register the Mac Runner source checkout with its canonical public remote,
+   fixed remote name, fixed branch, and `self-update-runner` test profile.
+4. Set `runner.app_dir`, `runner.service_label`, owner pubkey, helper path, and a
+   same-filesystem staging root in external config. Seed `app_dir/.source-commit`
+   with the exact deployed 40-character commit.
+5. Enable `self-update-runner`, restart once through the existing reviewed
+   deployment path, and require `status.runner.self_update.ready=true` with the
+   expected source marker, service label, and external helper.
+6. Only after a schema-only dry run remains `job_not_found` and no repository or
+   service mutation occurred may Windows set its separate self-update verified
+   gate. Every later update is a new privileged `(job_id, attempt)`.
+
+The privileged job updates the Runner app only. It never replaces the external
+helper that enforces the swap; updating that trust root requires another
+reviewed bootstrap.
 
 Runner SQLite state is authoritative. Buzz publication alone does not prove job
 receipt or completion; use the original thread's ACK, RUNNING, VERIFYING, and

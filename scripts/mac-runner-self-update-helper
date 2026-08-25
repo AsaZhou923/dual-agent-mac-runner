@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+HELPER_PATH = Path(__file__).resolve()
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("plan must be a JSON object")
+    return data
+
+
+def write_result(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bounded = json.loads(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+    raw = json.dumps(bounded, sort_keys=True, ensure_ascii=True)
+    if len(raw) > 16000:
+        bounded["details"] = {"truncated": True}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(bounded, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for current_root, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        filenames.sort()
+        current = Path(current_root)
+        for dirname in dirnames:
+            directory = current / dirname
+            if directory.is_symlink() or not stat.S_ISDIR(directory.lstat().st_mode):
+                raise RuntimeError("candidate contains an unsafe directory entry")
+        for filename in filenames:
+            path = current / filename
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("candidate contains an unsafe file entry")
+            relative = str(path.relative_to(root))
+            mode = metadata.st_mode & 0o777
+            digest.update(relative.encode("utf-8") + b"\0" + f"{mode:o}".encode("ascii") + b"\0")
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def backup_sqlite_db(db_path: Path, backup_dir: Path) -> None:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / db_path.name
+    source = sqlite3.connect(db_path)
+    target = sqlite3.connect(backup_path)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+
+def restore_db_family(db_path: Path, backup_dir: Path) -> None:
+    backup_main = backup_dir / db_path.name
+    if backup_main.exists():
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(backup_main)
+        target = sqlite3.connect(db_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+
+
+def sqlite_integrity(db_path: Path) -> str:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        return str(row[0] if row else "missing")
+    finally:
+        conn.close()
+
+
+def launchctl_pid(label: str) -> int | None:
+    uid = os.getuid()
+    proc = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{label}"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        for prefix in ("pid = ", "PID = "):
+            if stripped.startswith(prefix):
+                value = int(stripped.removeprefix(prefix))
+                return value if value > 0 else None
+    return 0 if "state = running" in proc.stdout.lower() else None
+
+
+def sanitized_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    env["HOME"] = os.environ.get("HOME", str(Path.home()))
+    return env
+
+
+def process_arguments(pid: int) -> list[str]:
+    proc = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-ww", "-o", "command="],
+        env=sanitized_env(),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError("could not inspect restarted LaunchAgent command")
+    try:
+        return shlex.split(proc.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("restarted LaunchAgent command was not parseable") from exc
+
+
+def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
+    app_dir = Path(plan["app_dir"]).resolve()
+    candidate_dir = Path(plan["candidate_dir"]).resolve()
+    candidate_sha256 = str(plan["candidate_sha256"])
+    backup_dir = Path(plan["backup_dir"]).resolve()
+    db_backup_dir = Path(plan["db_backup_dir"]).resolve()
+    prepared_dir = backup_dir.with_name(f"{backup_dir.name}.prepared")
+    failed_dir = backup_dir.with_name(f"{backup_dir.name}.failed-new")
+    config_path = Path(plan["config_path"]).resolve()
+    db_path = Path(plan["db_path"]).resolve()
+    service_label = str(plan["service_label"])
+    target_sha = str(plan["target_sha"])
+    before_pid = int(plan["before_pid"])
+    expected_runtime = Path(plan["runtime_path"]).resolve()
+    if not app_dir.is_dir() or not candidate_dir.is_dir():
+        raise RuntimeError("app_dir and candidate_dir must exist")
+    if sha256_hex(HELPER_PATH.read_bytes()) != plan["helper_sha256"]:
+        raise RuntimeError("helper hash did not match plan")
+    if tree_sha256(candidate_dir) != candidate_sha256:
+        raise RuntimeError("candidate tree hash changed after validation")
+    if app_dir == candidate_dir or app_dir in candidate_dir.parents or candidate_dir in app_dir.parents:
+        raise RuntimeError("candidate_dir must be separate from app_dir")
+    if backup_dir.exists() or prepared_dir.exists():
+        raise RuntimeError("backup/prepared directory already exists")
+    backup_dir.parent.mkdir(parents=True, exist_ok=True)
+    if app_dir.stat().st_dev != backup_dir.parent.stat().st_dev:
+        raise RuntimeError("app_dir and backup_dir must be on the same filesystem")
+    if sha256_hex(config_path.read_bytes()) != plan["config_sha256"]:
+        raise RuntimeError("config hash changed before self-update swap")
+    config_name = config_path.name if config_path.parent == app_dir else None
+    backup_sqlite_db(db_path, db_backup_dir)
+    shutil.copytree(candidate_dir, prepared_dir, symlinks=False)
+    if config_name:
+        shutil.copy2(config_path, prepared_dir / config_name)
+    app_backed_up = False
+    app_replaced = False
+    try:
+        app_dir.rename(backup_dir)
+        app_backed_up = True
+        prepared_dir.rename(app_dir)
+        app_replaced = True
+        marker = app_dir / ".source-commit"
+        if marker.read_text(encoding="utf-8").strip() != target_sha:
+            raise RuntimeError("source marker did not match target")
+        subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{service_label}"], check=True, timeout=30)
+        deadline = time.time() + 45
+        after_pid = None
+        while time.time() < deadline:
+            after_pid = launchctl_pid(service_label)
+            if after_pid is not None and after_pid != before_pid:
+                break
+            time.sleep(1)
+        if after_pid is None or after_pid == before_pid:
+            raise RuntimeError("LaunchAgent did not restart with a new PID")
+        process_args = process_arguments(after_pid)
+        actual_runtime = Path(process_args[0]).resolve() if process_args else Path("/")
+        if (
+            actual_runtime != expected_runtime
+            or sha256_hex(actual_runtime.read_bytes()) != plan["runtime_sha256"]
+            or str(app_dir / "runner.py") not in process_args
+            or str(config_path) not in process_args
+            or "serve" not in process_args
+        ):
+            raise RuntimeError("restarted LaunchAgent is not running the fixed Runner source/config")
+        runtime_version = subprocess.run(
+            [str(actual_runtime), "--version"],
+            env=sanitized_env(),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        version_text = (runtime_version.stdout or runtime_version.stderr).strip()
+        if runtime_version.returncode != 0 or plan["runtime_version"] not in version_text:
+            raise RuntimeError("restarted LaunchAgent runtime version did not match the plan")
+        if sha256_hex(config_path.read_bytes()) != plan["config_sha256"]:
+            raise RuntimeError("config hash changed after self-update restart")
+        if sqlite_integrity(db_path) != "ok":
+            raise RuntimeError("SQLite integrity check failed after restart")
+        status = subprocess.run(
+            [str(actual_runtime), str(app_dir / "runner.py"), "--config", str(config_path), "status"],
+            env=sanitized_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if status.returncode != 0:
+            raise RuntimeError("new runner status command failed")
+        try:
+            status_payload = json.loads(status.stdout)
+            self_update_status = status_payload["runner"]["self_update"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise RuntimeError("new runner status payload was invalid") from exc
+        if self_update_status.get("source_marker") != target_sha or self_update_status.get("ready") is not True:
+            raise RuntimeError("new runner status did not confirm self-update readiness")
+        queue = status_payload.get("queue")
+        git_status = status_payload.get("git")
+        if (
+            not isinstance(queue, dict)
+            or queue.get("pending") != 0
+            or queue.get("running") != 1
+            or not isinstance(git_status, dict)
+            or git_status.get("worktrees") != 0
+            or git_status.get("dirty_outside_jobs") is not False
+        ):
+            raise RuntimeError("new runner status did not confirm the isolated VERIFYING queue")
+        stored = subprocess.run(
+            [
+                str(actual_runtime),
+                str(app_dir / "runner.py"),
+                "--config",
+                str(config_path),
+                "get",
+                "--job-id",
+                str(plan["job_id"]),
+                "--attempt",
+                str(plan["attempt"]),
+            ],
+            env=sanitized_env(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        try:
+            stored_job = json.loads(stored.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("new runner could not read the original self-update job") from exc
+        if (
+            stored.returncode != 0
+            or stored_job.get("status") != "VERIFYING"
+            or stored_job.get("payload", {}).get("target_sha") != target_sha
+        ):
+            raise RuntimeError("original self-update job is not recoverable from VERIFYING")
+        return {
+            "schema": "mac-runner/self-update-result-v1",
+            "status": "succeeded",
+            "target_sha": target_sha,
+            "service_label": service_label,
+            "before_pid": before_pid,
+            "after_pid": after_pid,
+            "config_sha256": sha256_hex(config_path.read_bytes()),
+            "sqlite_integrity": "ok",
+            "runner_status": "ok",
+            "source_marker": target_sha,
+            "process_verified": True,
+            "queue": {
+                "pending": queue["pending"],
+                "running": queue["running"],
+                "retryable": queue.get("retryable"),
+                "worktrees": git_status["worktrees"],
+            },
+            "job_status": stored_job["status"],
+            "runtime_path": str(actual_runtime),
+            "runtime_sha256": plan["runtime_sha256"],
+            "runtime_version": plan["runtime_version"],
+        }
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        rollback_pid: int | None = None
+        rollback_verified = not app_backed_up
+        if app_backed_up:
+            try:
+                if app_replaced and app_dir.exists():
+                    app_dir.rename(failed_dir)
+                backup_dir.rename(app_dir)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"app:{type(rollback_exc).__name__}")
+        if app_backed_up:
+            try:
+                restore_db_family(db_path, db_backup_dir)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"db:{type(rollback_exc).__name__}")
+        if app_backed_up:
+            try:
+                restarted = subprocess.run(
+                    ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{service_label}"],
+                    check=False,
+                    timeout=30,
+                )
+                if restarted.returncode != 0:
+                    rollback_errors.append("launchctl:nonzero")
+                else:
+                    rollback_deadline = time.time() + 30
+                    while time.time() < rollback_deadline:
+                        rollback_pid = launchctl_pid(service_label)
+                        if rollback_pid is not None:
+                            break
+                        time.sleep(1)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"launchctl:{type(rollback_exc).__name__}")
+            try:
+                restored_marker = (app_dir / ".source-commit").read_text(encoding="utf-8").strip()
+                rollback_verified = (
+                    restored_marker == str(plan["base_sha"])
+                    and sha256_hex(config_path.read_bytes()) == plan["config_sha256"]
+                    and sqlite_integrity(db_path) == "ok"
+                    and rollback_pid is not None
+                    and not rollback_errors
+                )
+                if not rollback_verified:
+                    rollback_errors.append("postcondition:failed")
+            except Exception as rollback_exc:
+                rollback_errors.append(f"postcondition:{type(rollback_exc).__name__}")
+        return {
+            "schema": "mac-runner/self-update-result-v1",
+            "status": "failed",
+            "target_sha": target_sha,
+            "service_label": service_label,
+            "error": type(exc).__name__,
+            "rollback_errors": rollback_errors,
+            "rollback_pid": rollback_pid,
+            "rollback_verified": rollback_verified,
+        }
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        return 64
+    plan_path = Path(argv[1]).resolve()
+    result_path: Path | None = None
+    try:
+        plan = load_json(plan_path)
+        if plan.get("schema") != "mac-runner/self-update-plan-v1":
+            raise RuntimeError("unsupported plan schema")
+        result_path = Path(plan["result_path"]).resolve()
+        write_result(result_path, swap_app(plan))
+        return 0
+    except Exception as exc:
+        if result_path is None:
+            try:
+                raw = load_json(plan_path)
+                result_path = Path(raw.get("result_path", plan_path.with_name("helper-result.json"))).resolve()
+            except Exception:
+                result_path = plan_path.with_name("helper-result.json")
+        write_result(
+            result_path,
+            {
+                "schema": "mac-runner/self-update-result-v1",
+                "status": "failed",
+                "error": type(exc).__name__,
+            },
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

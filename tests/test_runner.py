@@ -168,6 +168,10 @@ class RunnerTests(unittest.TestCase):
         self._copy_fixture("job_schema.json")
         self._copy_fixture("result_schema.json")
         self._copy_fixture("runner.py")
+        (self.app_dir / ".source-commit").write_text("uninitialized\n", encoding="utf-8")
+        self.external_helper = self.root / "external-helper.py"
+        self._write_file(self.external_helper, "#!/usr/bin/env python3\n")
+        self.external_helper.chmod(0o755)
 
         self.codex_log = self.root / "codex-log.jsonl"
         self.fake_codex = self.app_dir / "fake_codex.py"
@@ -184,6 +188,10 @@ class RunnerTests(unittest.TestCase):
         self._write_file(
             self.profiles_dir / "git-sync-verify.toml",
             'command = ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"]\ntimeout_seconds = 30\n',
+        )
+        self._write_file(
+            self.profiles_dir / "self-update-runner.toml",
+            'command = ["/usr/bin/true"]\ntimeout_seconds = 30\n',
         )
 
         self.config_path = self._write_config()
@@ -277,6 +285,7 @@ class RunnerTests(unittest.TestCase):
             f"""
             [runner]
             state_dir = "{self.root / 'state'}"
+            app_dir = "{self.app_dir}"
             db_path = "{self.root / 'state' / 'runner.db'}"
             worktree_root = "{self.root / 'share' / 'worktrees'}"
             artifacts_dir = "{self.root / 'share' / 'artifacts'}"
@@ -310,7 +319,7 @@ class RunnerTests(unittest.TestCase):
             [repos.repo1]
             path = "{self.repo}"
             fetch_remote = "origin"
-            test_profiles = ["review-readonly", "backend-unit", "git-sync-verify"]
+            test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "self-update-runner"]
             sensitive_paths = {sensitive_paths}
             sync_enabled = true
             canonical_remote_url = "{self.origin}"
@@ -1090,6 +1099,412 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(future["error"]["code"], "invalid_owner_approval")
         subject.close()
 
+    def test_self_update_runner_is_default_disabled_and_requires_exact_owner_summary(self) -> None:
+        (self.app_dir / ".source-commit").write_text(f"{self.target_sha}\n", encoding="utf-8")
+        disabled = self._runner()
+        rejected = disabled.submit(
+            self._policy_v2_job(
+                job_id="self-update-disabled",
+                base_sha=self.target_sha,
+                target_sha=self.target_sha,
+                task_type="self-update",
+                permission_profile="privileged",
+                capabilities=["self-update-runner"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["self-update-runner"],
+                owner_approval={
+                    "approved_by": "1" * 64,
+                    "approval_ref": "oa-self-disabled",
+                    "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "summary": "capability=self-update-runner",
+                },
+            )
+        )
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(rejected["error"]["code"], "capability_unavailable")
+        disabled.close()
+
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="self-update-runner = true",
+                capability_bindings=f"""
+                [capability_bindings.self-update-runner]
+                repo_id = "repo1"
+                canonical_remote_url = "{self.origin}"
+                remote = "origin"
+                branch = "main"
+                service_label = "com.example.mac-runner"
+                helper_path = "{self.external_helper}"
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        status = subject.status()["runner"]["self_update"]
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["service_label"], "com.example.mac-runner")
+        self.assertEqual(status["source_marker"], self.target_sha)
+        good_summary = (
+            "capability=self-update-runner;repo=repo1;job=self-update-summary;attempt=1;"
+            f"base={self.target_sha};target={self.target_sha};service=com.example.mac-runner;"
+            f"url={self.origin};remote=origin;branch=main"
+        )
+        accepted = subject.validate_dry_run(
+            self._policy_v2_job(
+                job_id="self-update-summary",
+                base_sha=self.target_sha,
+                target_sha=self.target_sha,
+                task_type="self-update",
+                permission_profile="privileged",
+                capabilities=["self-update-runner"],
+                scope={"root": "registered-checkout", "paths": []},
+                network={"mode": "declared-remotes-and-registries"},
+                verification_profiles=["self-update-runner"],
+                owner_approval={
+                    "approved_by": "1" * 64,
+                    "approval_ref": "oa-self-summary",
+                    "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "summary": good_summary,
+                },
+            )
+        )
+        self.assertEqual(accepted["status"], "VALIDATED")
+        subject.close()
+
+        self.external_helper.chmod(0o777)
+        with self.assertRaisesRegex(runner.RunnerError, "not group/other writable"):
+            runner.RunnerConfig.load(
+                self._write_config(
+                    owner_pubkey="1" * 64,
+                    extra_capabilities="self-update-runner = true",
+                    capability_bindings=f"""
+                    [capability_bindings.self-update-runner]
+                    repo_id = "repo1"
+                    canonical_remote_url = "{self.origin}"
+                    remote = "origin"
+                    branch = "main"
+                    service_label = "com.example.mac-runner"
+                    helper_path = "{self.external_helper}"
+                    """,
+                )
+            )
+
+    def test_self_update_noop_finishes_without_helper(self) -> None:
+        (self.app_dir / ".source-commit").write_text(f"{self.target_sha}\n", encoding="utf-8")
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="self-update-runner = true",
+                capability_bindings=f"""
+                [capability_bindings.self-update-runner]
+                repo_id = "repo1"
+                canonical_remote_url = "{self.origin}"
+                remote = "origin"
+                branch = "main"
+                service_label = "com.example.mac-runner"
+                helper_path = "{self.external_helper}"
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        job_id = "self-update-noop"
+        summary = (
+            f"capability=self-update-runner;repo=repo1;job={job_id};attempt=1;"
+            f"base={self.target_sha};target={self.target_sha};service=com.example.mac-runner;"
+            f"url={self.origin};remote=origin;branch=main"
+        )
+        self.assertEqual(
+            subject.submit(
+                self._policy_v2_job(
+                    job_id=job_id,
+                    base_sha=self.target_sha,
+                    target_sha=self.target_sha,
+                    task_type="self-update",
+                    permission_profile="privileged",
+                    capabilities=["self-update-runner"],
+                    scope={"root": "registered-checkout", "paths": []},
+                    network={"mode": "declared-remotes-and-registries"},
+                    verification_profiles=["self-update-runner"],
+                    owner_approval={
+                        "approved_by": "1" * 64,
+                        "approval_ref": "oa-self-noop",
+                        "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "summary": summary,
+                    },
+                )
+            )["status"],
+            "VALIDATED",
+        )
+        original_run_command = runner.run_command
+
+        def fake_launchctl(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args and args[0] == "launchctl":
+                return subprocess.CompletedProcess(args, 0, stdout="pid = 123\n", stderr="")
+            return original_run_command(args, **kwargs)
+
+        with (
+            mock.patch.object(runner, "run_command", side_effect=fake_launchctl),
+            mock.patch.object(runner, "subprocess", wraps=runner.subprocess) as subprocess_module,
+        ):
+            result = subject.execute(job_id, 1)
+        subprocess_module.Popen.assert_not_called()
+        self.assertEqual(result["status"], "DONE")
+        self.assertEqual(result["result"]["commit_sha"], self.target_sha)
+        subject.close()
+
+    def test_self_update_requires_quiescent_runner(self) -> None:
+        base = self.target_sha
+        target = self._commit_repo_file("runner.py", "print('new runner')\n", "self update candidate busy")
+        self._run("git", "-C", str(self.repo), "reset", "--hard", base)
+        (self.app_dir / ".source-commit").write_text(f"{base}\n", encoding="utf-8")
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="self-update-runner = true",
+                capability_bindings=f"""
+                [capability_bindings.self-update-runner]
+                repo_id = "repo1"
+                canonical_remote_url = "{self.origin}"
+                remote = "origin"
+                branch = "main"
+                service_label = "com.example.mac-runner"
+                helper_path = "{self.external_helper}"
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        self.assertEqual(subject.submit(self._policy_v2_job(job_id="other-pending"))["status"], "VALIDATED")
+        job_id = "self-update-busy"
+        summary = (
+            f"capability=self-update-runner;repo=repo1;job={job_id};attempt=1;"
+            f"base={base};target={target};service=com.example.mac-runner;"
+            f"url={self.origin};remote=origin;branch=main"
+        )
+        self.assertEqual(
+            subject.submit(
+                self._policy_v2_job(
+                    job_id=job_id,
+                    base_sha=base,
+                    target_sha=target,
+                    task_type="self-update",
+                    permission_profile="privileged",
+                    capabilities=["self-update-runner"],
+                    scope={"root": "registered-checkout", "paths": []},
+                    network={"mode": "declared-remotes-and-registries"},
+                    verification_profiles=["self-update-runner"],
+                    owner_approval={
+                        "approved_by": "1" * 64,
+                        "approval_ref": "oa-self-busy",
+                        "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "summary": summary,
+                    },
+                )
+            )["status"],
+            "VALIDATED",
+        )
+        failed = subject.execute(job_id, 1)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "runner_not_quiescent")
+        subject.close()
+
+    def test_self_update_starts_helper_then_resumes_from_success_result(self) -> None:
+        base = self.target_sha
+        target = self._commit_repo_file("runner.py", "print('new runner')\n", "self update candidate")
+        self._run("git", "-C", str(self.repo), "reset", "--hard", base)
+        (self.app_dir / ".source-commit").write_text(f"{base}\n", encoding="utf-8")
+        writes_during_validation = "from pathlib import Path; Path('validator-output.txt').write_text('dirty\\n', encoding='utf-8')"
+        self._write_file(
+            self.profiles_dir / "self-update-runner.toml",
+            f'command = ["python3", "-c", {json.dumps(writes_during_validation)}]\ntimeout_seconds = 30\n',
+        )
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="self-update-runner = true",
+                capability_bindings=f"""
+                [capability_bindings.self-update-runner]
+                repo_id = "repo1"
+                canonical_remote_url = "{self.origin}"
+                remote = "origin"
+                branch = "main"
+                service_label = "com.example.mac-runner"
+                helper_path = "{self.external_helper}"
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        job_id = "self-update-start"
+        summary = (
+            f"capability=self-update-runner;repo=repo1;job={job_id};attempt=1;"
+            f"base={base};target={target};service=com.example.mac-runner;"
+            f"url={self.origin};remote=origin;branch=main"
+        )
+        job = self._policy_v2_job(
+            job_id=job_id,
+            base_sha=base,
+            target_sha=target,
+            task_type="self-update",
+            permission_profile="privileged",
+            capabilities=["self-update-runner"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "declared-remotes-and-registries"},
+            verification_profiles=["self-update-runner"],
+            owner_approval={
+                "approved_by": "1" * 64,
+                "approval_ref": "oa-self-start",
+                "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "summary": summary,
+            },
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        original_run_command = runner.run_command
+
+        def fake_launchctl(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args and args[0] == "launchctl":
+                return subprocess.CompletedProcess(args, 0, stdout="pid = 123\n", stderr="")
+            return original_run_command(args, **kwargs)
+
+        original_popen = subprocess.Popen
+        helper_starts: list[list[str]] = []
+
+        def fake_popen(args: list[str], **kwargs: object) -> object:
+            if str(self.external_helper) in args:
+                self.assertEqual(subject.get(job_id, 1)["status"], "VERIFYING")
+                helper_starts.append(args)
+                return mock.Mock()
+            return original_popen(args, **kwargs)
+
+        with (
+            mock.patch.object(runner, "run_command", side_effect=fake_launchctl),
+            mock.patch.object(runner.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            started = subject.execute(job_id, 1)
+        self.assertEqual(started["status"], "VERIFYING")
+        self.assertEqual(len(helper_starts), 1)
+        worker = subject._read_artifact(started, "worker-result")
+        deploy_candidate = Path(worker["outcome"]["candidate_dir"])
+        self.assertFalse((deploy_candidate / "validator-output.txt").exists())
+        staged_plan = subject._read_artifact(started, "self-update-plan")
+        self.assertEqual(staged_plan["candidate_sha256"], subject._tree_sha256(deploy_candidate))
+        result_path = Path(worker["outcome"]["result_path"])
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema": "mac-runner/self-update-result-v1",
+                    "status": "succeeded",
+                    "target_sha": target,
+                    "service_label": "com.example.mac-runner",
+                    "before_pid": 123,
+                    "after_pid": 456,
+                    "config_sha256": config.config_sha256,
+                    "sqlite_integrity": "ok",
+                    "runner_status": "ok",
+                    "source_marker": target,
+                    "process_verified": True,
+                    "queue": {"pending": 0, "running": 1, "retryable": 0, "worktrees": 0},
+                    "job_status": "VERIFYING",
+                    "runtime_path": worker["outcome"]["runtime_path"],
+                    "runtime_sha256": worker["outcome"]["runtime_sha256"],
+                    "runtime_version": worker["outcome"]["runtime_version"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        resumed = subject.execute(job_id, 1)
+        self.assertEqual(resumed["status"], "DONE", resumed)
+        self.assertEqual(resumed["result"]["commit_sha"], target)
+        subject.close()
+
+    def test_self_update_resume_failure_becomes_terminal_failed(self) -> None:
+        base = self.target_sha
+        target = self._commit_repo_file("runner.py", "print('bad runner')\n", "bad self update candidate")
+        self._run("git", "-C", str(self.repo), "reset", "--hard", base)
+        (self.app_dir / ".source-commit").write_text(f"{base}\n", encoding="utf-8")
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                owner_pubkey="1" * 64,
+                extra_capabilities="self-update-runner = true",
+                capability_bindings=f"""
+                [capability_bindings.self-update-runner]
+                repo_id = "repo1"
+                canonical_remote_url = "{self.origin}"
+                remote = "origin"
+                branch = "main"
+                service_label = "com.example.mac-runner"
+                helper_path = "{self.external_helper}"
+                """,
+            )
+        )
+        subject = runner.Runner(config)
+        job_id = "self-update-fail"
+        summary = (
+            f"capability=self-update-runner;repo=repo1;job={job_id};attempt=1;"
+            f"base={base};target={target};service=com.example.mac-runner;"
+            f"url={self.origin};remote=origin;branch=main"
+        )
+        self.assertEqual(
+            subject.submit(
+                self._policy_v2_job(
+                    job_id=job_id,
+                    base_sha=base,
+                    target_sha=target,
+                    task_type="self-update",
+                    permission_profile="privileged",
+                    capabilities=["self-update-runner"],
+                    scope={"root": "registered-checkout", "paths": []},
+                    network={"mode": "declared-remotes-and-registries"},
+                    verification_profiles=["self-update-runner"],
+                    owner_approval={
+                        "approved_by": "1" * 64,
+                        "approval_ref": "oa-self-fail",
+                        "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "summary": summary,
+                    },
+                )
+            )["status"],
+            "VALIDATED",
+        )
+        original_run_command = runner.run_command
+
+        def fake_launchctl(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args and args[0] == "launchctl":
+                return subprocess.CompletedProcess(args, 0, stdout="pid = 123\n", stderr="")
+            return original_run_command(args, **kwargs)
+
+        original_popen = subprocess.Popen
+        helper_starts: list[list[str]] = []
+
+        def fake_popen(args: list[str], **kwargs: object) -> object:
+            if str(self.external_helper) in args:
+                helper_starts.append(args)
+                return mock.Mock()
+            return original_popen(args, **kwargs)
+
+        with (
+            mock.patch.object(runner, "run_command", side_effect=fake_launchctl),
+            mock.patch.object(runner.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            started = subject.execute(job_id, 1)
+        self.assertEqual(len(helper_starts), 1)
+        worker = subject._read_artifact(started, "worker-result")
+        result_path = Path(worker["outcome"]["result_path"])
+        result_path.write_text(
+            json.dumps(
+                {
+                    "schema": "mac-runner/self-update-result-v1",
+                    "status": "failed",
+                    "target_sha": target,
+                    "error": "injected failure",
+                }
+            ),
+            encoding="utf-8",
+        )
+        failed = subject.execute(job_id, 1)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error"]["code"], "self_update_failed")
+        subject.close()
+
     def test_legacy_write_with_empty_allowed_paths_maps_to_full_worktree(self) -> None:
         verify_code = "from pathlib import Path; raise SystemExit(0 if Path('README.md').read_text(encoding='utf-8').strip() == 'changed by fake codex' else 9)"
         self._write_file(
@@ -1370,8 +1785,8 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         config_path = self._write_config()
         config_path.write_text(
             config_path.read_text(encoding="utf-8").replace(
-                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify"]',
-                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "profile-first", "profile-second"]',
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "self-update-runner"]',
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "self-update-runner", "profile-first", "profile-second"]',
             ),
             encoding="utf-8",
         )
@@ -1519,8 +1934,8 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         )
         config_path.write_text(
             config_path.read_text(encoding="utf-8").replace(
-                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify"]',
-                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "profile-fail"]',
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "self-update-runner"]',
+                'test_profiles = ["review-readonly", "backend-unit", "git-sync-verify", "self-update-runner", "profile-fail"]',
             ),
             encoding="utf-8",
         )

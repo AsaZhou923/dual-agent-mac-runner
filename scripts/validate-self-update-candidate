@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import compileall
+import importlib.util
+import json
+import os
+import plistlib
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
+
+
+def validate_migration_copy(root: Path) -> bool:
+    raw_db_path = os.environ.get("MAC_RUNNER_SELF_UPDATE_DB_COPY")
+    if not raw_db_path:
+        print("MAC_RUNNER_SELF_UPDATE_DB_COPY is required", file=sys.stderr)
+        return False
+    db_path = Path(raw_db_path).resolve()
+    if not db_path.is_file() or db_path.stat().st_mode & 0o077:
+        print("migration DB copy is missing or not private", file=sys.stderr)
+        return False
+    spec = importlib.util.spec_from_file_location("candidate_mac_runner", root / "runner.py")
+    if spec is None or spec.loader is None:
+        return False
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    ledger = module.Ledger(db_path, db_path.with_suffix(".validation.log"))
+    try:
+        row = ledger.conn.execute("PRAGMA integrity_check").fetchone()
+        return bool(row and row[0] == "ok")
+    finally:
+        ledger.close()
+
+
+def main() -> int:
+    root = Path.cwd().resolve()
+    required = [
+        root / "runner.py",
+        root / "schemas" / "job_schema.json",
+        root / "schemas" / "result_schema.json",
+        root / ".source-commit",
+    ]
+    missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
+    if missing:
+        print(f"missing required files: {missing}", file=sys.stderr)
+        return 2
+    if not compileall.compile_file(str(root / "runner.py"), quiet=1):
+        return 3
+    for path in sorted((root / "schemas").glob("*.json")):
+        json.loads(path.read_text(encoding="utf-8"))
+    for path in sorted(root.rglob("*.toml")):
+        tomllib.loads(path.read_text(encoding="utf-8"))
+    for path in sorted(root.rglob("*.plist")):
+        with path.open("rb") as handle:
+            plistlib.load(handle)
+    if not validate_migration_copy(root):
+        return 4
+    proc = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    sys.stdout.write(proc.stdout[-12000:])
+    sys.stderr.write(proc.stderr[-12000:])
+    return proc.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

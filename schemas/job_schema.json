@@ -53,7 +53,8 @@
         "fix",
         "prepare",
         "test",
-        "sync"
+        "sync",
+        "self-update"
       ]
     },
     "focus": {
@@ -107,7 +108,8 @@
           "push-task-branch",
           "manage-pr",
           "install-user-tool",
-          "restart-user-service"
+          "restart-user-service",
+          "self-update-runner"
         ]
       },
       "maxItems": 8
