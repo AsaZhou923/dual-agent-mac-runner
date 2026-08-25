@@ -169,7 +169,8 @@ class RunnerTests(unittest.TestCase):
         self._copy_fixture("result_schema.json")
         self._copy_fixture("runner.py")
         (self.app_dir / ".source-commit").write_text("uninitialized\n", encoding="utf-8")
-        self.external_helper = self.root / "external-helper.py"
+        self.helper_tempdir = tempfile.TemporaryDirectory(dir="/tmp")
+        self.external_helper = Path(self.helper_tempdir.name) / "external-helper.py"
         self._write_file(self.external_helper, "#!/usr/bin/env python3\n")
         self.external_helper.chmod(0o755)
 
@@ -203,6 +204,7 @@ class RunnerTests(unittest.TestCase):
         os.environ.update(self.original_env)
         self.server.shutdown()
         self.server.server_close()
+        self.helper_tempdir.cleanup()
         self.tempdir.cleanup()
 
     def _copy_fixture(self, name: str) -> None:
