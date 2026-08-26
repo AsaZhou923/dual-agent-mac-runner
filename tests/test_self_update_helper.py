@@ -172,6 +172,25 @@ class SelfUpdateHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsafe file"):
             helper.tree_sha256(self.candidate)
 
+    def test_process_runtime_identity_resolves_framework_binary(self) -> None:
+        launcher = self.root / "python-launcher"
+        process_runtime = self.root / "Python"
+        launcher.write_bytes(b"launcher")
+        process_runtime.write_bytes(b"framework-runtime")
+        completed = subprocess.CompletedProcess(
+            [str(launcher)],
+            0,
+            stdout=f"{process_runtime}\n",
+            stderr="",
+        )
+        with mock.patch.object(helper.subprocess, "run", return_value=completed):
+            resolved, digest = helper.process_runtime_identity(
+                launcher,
+                hashlib.sha256(launcher.read_bytes()).hexdigest(),
+            )
+        self.assertEqual(resolved, process_runtime.resolve())
+        self.assertEqual(digest, hashlib.sha256(process_runtime.read_bytes()).hexdigest())
+
 
 if __name__ == "__main__":
     unittest.main()

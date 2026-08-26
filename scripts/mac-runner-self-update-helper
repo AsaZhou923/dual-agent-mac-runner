@@ -148,6 +148,31 @@ def process_arguments(pid: int) -> list[str]:
         raise RuntimeError("restarted LaunchAgent command was not parseable") from exc
 
 
+def process_runtime_identity(expected_runtime: Path, expected_sha256: str) -> tuple[Path, str]:
+    if not expected_runtime.is_file() or sha256_hex(expected_runtime.read_bytes()) != expected_sha256:
+        raise RuntimeError("planned Python launcher hash did not verify")
+    identity = subprocess.run(
+        [
+            str(expected_runtime),
+            "-I",
+            "-S",
+            "-c",
+            "import sys; print(sys._base_executable)",
+        ],
+        env=sanitized_env(),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if identity.returncode != 0 or not identity.stdout.strip():
+        raise RuntimeError("planned Python launcher did not report its process runtime")
+    process_runtime = Path(identity.stdout.strip()).resolve()
+    if not process_runtime.is_file():
+        raise RuntimeError("planned Python process runtime is not a regular file")
+    return process_runtime, sha256_hex(process_runtime.read_bytes())
+
+
 def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
     stage = "preflight"
     app_dir = Path(plan["app_dir"]).resolve()
@@ -163,6 +188,10 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
     target_sha = str(plan["target_sha"])
     before_pid = int(plan["before_pid"])
     expected_runtime = Path(plan["runtime_path"]).resolve()
+    expected_process_runtime, expected_process_sha256 = process_runtime_identity(
+        expected_runtime,
+        str(plan["runtime_sha256"]),
+    )
     if not app_dir.is_dir() or not candidate_dir.is_dir():
         raise RuntimeError("app_dir and candidate_dir must exist")
     if sha256_hex(HELPER_PATH.read_bytes()) != plan["helper_sha256"]:
@@ -211,8 +240,8 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
         process_args = process_arguments(after_pid)
         actual_runtime = Path(process_args[0]).resolve() if process_args else Path("/")
         if (
-            actual_runtime != expected_runtime
-            or sha256_hex(actual_runtime.read_bytes()) != plan["runtime_sha256"]
+            actual_runtime != expected_process_runtime
+            or sha256_hex(actual_runtime.read_bytes()) != expected_process_sha256
             or str(app_dir / "runner.py") not in process_args
             or str(config_path) not in process_args
             or "serve" not in process_args
@@ -324,9 +353,11 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
                 "worktrees": git_status["worktrees"],
             },
             "job_status": stored_job["status"],
-            "runtime_path": str(actual_runtime),
+            "runtime_path": str(expected_runtime),
             "runtime_sha256": plan["runtime_sha256"],
             "runtime_version": plan["runtime_version"],
+            "process_runtime_path": str(actual_runtime),
+            "process_runtime_sha256": expected_process_sha256,
         }
     except Exception as exc:
         rollback_errors: list[str] = []
