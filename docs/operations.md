@@ -69,9 +69,14 @@ return the stored attempt without adding another job or event.
   config snapshot: exact untracked-status SHA-256/count, allowed pre-repair
   remote URLs, canonical remote, and an external backup root. It moves only
   contained regular untracked files, writes and verifies a size/SHA-256
-  manifest, repairs only the fixed remote URL, and rolls back on failure.
+  manifest, repairs only the fixed remote URL, and rolls back on failure. Git
+  ignored files stay in place; the Runner records and rechecks a deterministic
+  ignored-path inventory instead of copying dependency and cache trees.
 - `sync-registered-repo` requires the reserved `git-sync-verify` profile and a
   clean registered checkout on the configured branch and canonical remote.
+  Before a fast-forward it rejects any exact or file/directory-prefix collision
+  between retained ignored paths and the immutable target tree, and it fails if
+  the ignored inventory changes during preflight.
 - `self-update-runner` is privileged, default-disabled, and requires the
   reserved `self-update-runner` profile, a configured owner pubkey, the fixed
   Runner LaunchAgent label, an external one-shot helper path, and a registered

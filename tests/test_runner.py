@@ -718,6 +718,10 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
 
     def test_policy_v2_sync_accepts_root_scope_without_paths_and_records_wire_hash(self) -> None:
         self._prepare_sync_repo()
+        info_exclude = self.repo / ".git" / "info" / "exclude"
+        info_exclude.write_text("retained-cache.bin\n", encoding="utf-8")
+        ignored = self.repo / "retained-cache.bin"
+        ignored.write_text("local cache\n", encoding="utf-8")
         config = runner.RunnerConfig.load(
             self._write_config(
                 extra_capabilities="sync-registered-repo = true",
@@ -744,6 +748,35 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertRegex(stored["wire_payload_hash"], r"^[0-9a-f]{64}$")
         self.assertEqual(stored["wire_payload"]["scope"]["paths"], [])
         self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.target_sha)
+        self.assertEqual(ignored.read_text(encoding="utf-8"), "local cache\n")
+        subject.close()
+
+    def test_policy_v2_sync_rejects_ignored_target_collision_before_head_mutation(self) -> None:
+        collision_target = self._commit_repo_file("generated/cache.bin", "tracked\n", "track generated cache")
+        self._prepare_sync_repo()
+        info_exclude = self.repo / ".git" / "info" / "exclude"
+        info_exclude.write_text("generated\n", encoding="utf-8")
+        ignored = self.repo / "generated"
+        ignored.write_text("local cache\n", encoding="utf-8")
+        config = runner.RunnerConfig.load(self._write_config(extra_capabilities="sync-registered-repo = true"))
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="sync-ignored-collision",
+            task_type="sync",
+            permission_profile="operational",
+            capabilities=["sync-registered-repo"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "declared-remotes-and-registries"},
+            verification_profiles=["git-sync-verify"],
+            execution_route="auto",
+            target_sha=collision_target,
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        result = subject.execute("sync-ignored-collision", 1)
+        self.assertEqual(result["status"], "FAILED", result)
+        self.assertEqual(result["error"]["code"], "ignored_target_collision", result)
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), self.base_sha)
+        self.assertEqual(ignored.read_text(encoding="utf-8"), "local cache\n")
         subject.close()
 
     def test_policy_v2_prepare_registered_repo_backs_up_untracked_files_and_repairs_remote(self) -> None:
@@ -753,6 +786,11 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         first.write_text("first\n", encoding="utf-8")
         second = self.repo / "second.txt"
         second.write_text("second\n", encoding="utf-8")
+        info_exclude = self.repo / ".git" / "info" / "exclude"
+        info_exclude.write_text("retained-cache/\n", encoding="utf-8")
+        ignored = self.repo / "retained-cache" / "cache.bin"
+        ignored.parent.mkdir()
+        ignored.write_text("local cache\n", encoding="utf-8")
         previous_remote = self.root / "old-origin.git"
         self._run("git", "-C", str(self.repo), "remote", "set-url", "origin", str(previous_remote))
         status_text = self._run(
@@ -807,6 +845,10 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual((backup / "notes" / "first.txt").read_text(encoding="utf-8"), "first\n")
         self.assertEqual((backup / "second.txt").read_text(encoding="utf-8"), "second\n")
         self.assertTrue((backup / "manifest.json").is_file())
+        self.assertEqual(ignored.read_text(encoding="utf-8"), "local cache\n")
+        worker = subject._read_artifact(result, "worker-result")
+        self.assertEqual(worker["outcome"]["ignored_file_count"], 1)
+        self.assertRegex(worker["outcome"]["ignored_paths_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(self._git(self.repo, "remote", "get-url", "origin"), str(self.origin))
         subject.close()
 
@@ -853,6 +895,74 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         self.assertEqual(untracked.read_text(encoding="utf-8"), "keep\n")
         self.assertFalse(backup_root.exists())
         self.assertEqual(self._git(self.repo, "remote", "get-url", "origin"), str(self.origin))
+        subject.close()
+
+    def test_prepare_registered_repo_ignored_inventory_drift_rolls_back_visible_backup(self) -> None:
+        self._prepare_sync_repo()
+        visible = self.repo / "keep.txt"
+        visible.write_text("keep\n", encoding="utf-8")
+        info_exclude = self.repo / ".git" / "info" / "exclude"
+        info_exclude.write_text("cache.bin\n", encoding="utf-8")
+        ignored = self.repo / "cache.bin"
+        ignored.write_text("cache\n", encoding="utf-8")
+        status_text = self._run(
+            "git", "-C", str(self.repo), "status", "--porcelain=v1", "--untracked-files=all"
+        ).stdout
+        backup_root = self.root / "prep-backups-ignored-drift"
+        config = runner.RunnerConfig.load(
+            self._write_config(
+                extra_capabilities="prepare-registered-repo = true",
+                repo_prepare_config=textwrap.dedent(
+                    f"""
+                    prepare_enabled = true
+                    prepare_backup_root = "{backup_root}"
+                    prepare_expected_status_sha256 = "{runner.sha256_hex(status_text.encode('utf-8'))}"
+                    prepare_expected_untracked_count = 1
+                    prepare_allowed_remote_urls = ["{self.origin}"]
+                    """
+                ).strip(),
+            )
+        )
+        subject = runner.Runner(config)
+        job = self._policy_v2_job(
+            job_id="prepare-ignored-drift",
+            base_sha=self.base_sha,
+            target_sha=self.base_sha,
+            task_type="prepare",
+            permission_profile="operational",
+            capabilities=["prepare-registered-repo"],
+            scope={"root": "registered-checkout", "paths": []},
+            network={"mode": "none"},
+            verification_profiles=["review-readonly"],
+        )
+        self.assertEqual(subject.submit(job)["status"], "VALIDATED")
+        original_inventory = subject.sync._ignored_inventory
+        inventory_calls = 0
+
+        def drift_once(repo: runner.RepoConfig, deadline: runner.Deadline) -> tuple[list[str], str]:
+            nonlocal inventory_calls
+            inventory_calls += 1
+            paths, digest = original_inventory(repo, deadline)
+            if inventory_calls == 2:
+                changed = [*paths, "injected-drift.bin"]
+                encoded = "".join(f"{path}\0" for path in changed).encode("utf-8")
+                return changed, runner.sha256_hex(encoded)
+            return paths, digest
+
+        with (
+            mock.patch.object(
+                subject,
+                "_run_capability_verification",
+                return_value={"profile": "review-readonly", "exit_code": 0},
+            ),
+            mock.patch.object(subject.sync, "_ignored_inventory", side_effect=drift_once),
+        ):
+            result = subject.execute("prepare-ignored-drift", 1)
+        self.assertEqual(result["status"], "FAILED", result)
+        self.assertEqual(result["error"]["code"], "prep_ignored_inventory_changed", result)
+        self.assertEqual(visible.read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(ignored.read_text(encoding="utf-8"), "cache\n")
+        self.assertFalse((backup_root / "prepare-ignored-drift-attempt-1").exists())
         subject.close()
 
     def test_prepare_registered_repo_move_failure_restores_exact_status(self) -> None:

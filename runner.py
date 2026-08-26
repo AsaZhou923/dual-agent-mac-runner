@@ -1473,6 +1473,49 @@ class GitSyncManager:
         ):
             raise RunnerError("prepare_config_incomplete", f"Repository {repo.repo_id} has incomplete preparation config")
 
+    def _ignored_inventory(self, repo: RepoConfig, deadline: Deadline) -> tuple[list[str], str]:
+        ignored = self._git(
+            repo,
+            ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+            deadline,
+        )
+        paths = sorted(path for path in ignored.stdout.split("\0") if path)
+        for path in paths:
+            candidate = Path(path)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise RunnerError("path_escape", f"Ignored path is not repository-relative: {path}")
+        encoded = "".join(f"{path}\0" for path in paths).encode("utf-8")
+        return paths, sha256_hex(encoded)
+
+    @staticmethod
+    def _parent_paths(path: str) -> list[str]:
+        parts = Path(path).parts
+        return [Path(*parts[:index]).as_posix() for index in range(1, len(parts))]
+
+    def _assert_ignored_target_safe(
+        self,
+        repo: RepoConfig,
+        target_sha: str,
+        ignored_paths: list[str],
+        deadline: Deadline,
+    ) -> None:
+        if not ignored_paths:
+            return
+        target = self._git(repo, ["ls-tree", "-rz", "--name-only", target_sha], deadline)
+        target_paths = {path for path in target.stdout.split("\0") if path}
+        ignored_set = set(ignored_paths)
+        collisions = ignored_set & target_paths
+        for path in ignored_paths:
+            collisions.update(parent for parent in self._parent_paths(path) if parent in target_paths)
+        for path in target_paths:
+            collisions.update(parent for parent in self._parent_paths(path) if parent in ignored_set)
+        if collisions:
+            raise RunnerError(
+                "ignored_target_collision",
+                "Retained ignored paths collide with files in the immutable sync target",
+                details={"paths": sorted(collisions)[:32], "entry_count": len(collisions)},
+            )
+
     def prepare_registered_checkout(
         self,
         repo: RepoConfig,
@@ -1541,18 +1584,7 @@ class GitSyncManager:
                 )
             if any(not line.startswith("?? ") for line in status_lines):
                 raise RunnerError("prep_tracked_changes", "Preparation refuses staged or tracked changes")
-            ignored = self._git(
-                repo,
-                ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-                deadline,
-            )
-            ignored_paths = [path for path in ignored.stdout.split("\0") if path]
-            if ignored_paths:
-                raise RunnerError(
-                    "prep_ignored_files",
-                    "Preparation refuses ignored files that are absent from the immutable backup snapshot",
-                    details={"entry_count": len(ignored_paths)},
-                )
+            ignored_paths, ignored_paths_hash = self._ignored_inventory(repo, deadline)
 
             status_z = self._git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], deadline)
             records = [record for record in status_z.stdout.split("\0") if record]
@@ -1640,6 +1672,18 @@ class GitSyncManager:
                     raise RunnerError("prep_remote_verify_failed", "Canonical remote repair did not verify exactly")
                 if self._rev_parse(repo, "HEAD", deadline) != head:
                     raise RunnerError("prep_head_changed", "Preparation unexpectedly changed HEAD")
+                final_ignored_paths, final_ignored_hash = self._ignored_inventory(repo, deadline)
+                if final_ignored_paths != ignored_paths or final_ignored_hash != ignored_paths_hash:
+                    raise RunnerError(
+                        "prep_ignored_inventory_changed",
+                        "Ignored path inventory changed during preparation",
+                        details={
+                            "expected_count": len(ignored_paths),
+                            "actual_count": len(final_ignored_paths),
+                            "expected_sha256": ignored_paths_hash,
+                            "actual_sha256": final_ignored_hash,
+                        },
+                    )
                 return {
                     "repo_id": repo.repo_id,
                     "branch": repo.sync_branch,
@@ -1648,6 +1692,8 @@ class GitSyncManager:
                     "file_count": len(manifest_entries),
                     "total_bytes": total_bytes,
                     "manifest_sha256": manifest_hash,
+                    "ignored_file_count": len(ignored_paths),
+                    "ignored_paths_sha256": ignored_paths_hash,
                     "status_sha256_before": status_hash,
                     "status_sha256_after": sha256_hex(b""),
                     "remote_before": original_remote,
@@ -1693,6 +1739,12 @@ class GitSyncManager:
                         rollback_errors.append("status hash did not restore")
                 except RunnerError as rollback_exc:
                     rollback_errors.append(f"status verification: {rollback_exc.code}")
+                try:
+                    restored_ignored, restored_ignored_hash = self._ignored_inventory(repo, deadline)
+                    if restored_ignored != ignored_paths or restored_ignored_hash != ignored_paths_hash:
+                        rollback_errors.append("ignored path inventory did not restore")
+                except RunnerError as rollback_exc:
+                    rollback_errors.append(f"ignored inventory verification: {rollback_exc.code}")
                 for entry in manifest_entries:
                     restored_source = (repo.path / str(entry["path"])).resolve()
                     try:
@@ -1719,6 +1771,7 @@ class GitSyncManager:
 
     def preflight(self, repo: RepoConfig, payload: dict[str, Any], deadline: Deadline) -> dict[str, Any]:
         self.assert_configured(repo)
+        ignored_paths, ignored_paths_hash = self._ignored_inventory(repo, deadline)
         snapshot = self._verify_checkout(repo, payload, deadline, allowed_heads={payload["base_sha"]})
         self._fetch(repo, deadline)
         remote_head = self._remote_head(repo, deadline)
@@ -1729,7 +1782,16 @@ class GitSyncManager:
                 details={"expected": payload["target_sha"], "actual": remote_head},
             )
         self._assert_ancestor(repo, payload["base_sha"], payload["target_sha"], deadline)
-        return {**snapshot, "remote_head": remote_head}
+        current_ignored, current_ignored_hash = self._ignored_inventory(repo, deadline)
+        if current_ignored != ignored_paths or current_ignored_hash != ignored_paths_hash:
+            raise RunnerError("ignored_inventory_changed", "Ignored path inventory changed during sync preflight")
+        self._assert_ignored_target_safe(repo, payload["target_sha"], ignored_paths, deadline)
+        return {
+            **snapshot,
+            "remote_head": remote_head,
+            "ignored_file_count": len(ignored_paths),
+            "ignored_paths_sha256": ignored_paths_hash,
+        }
 
     def apply_and_verify(
         self,
@@ -1740,6 +1802,7 @@ class GitSyncManager:
         prepared: bool,
     ) -> dict[str, Any]:
         self.assert_configured(repo)
+        ignored_paths, ignored_paths_hash = self._ignored_inventory(repo, deadline)
         if not prepared:
             self._verify_checkout(
                 repo,
@@ -1764,6 +1827,10 @@ class GitSyncManager:
         before_sha = snapshot["head"]
         if before_sha == payload["base_sha"]:
             self._assert_ancestor(repo, before_sha, payload["target_sha"], deadline)
+            current_ignored, current_ignored_hash = self._ignored_inventory(repo, deadline)
+            if current_ignored != ignored_paths or current_ignored_hash != ignored_paths_hash:
+                raise RunnerError("ignored_inventory_changed", "Ignored path inventory changed before sync mutation")
+            self._assert_ignored_target_safe(repo, payload["target_sha"], ignored_paths, deadline)
             merge = self._git(
                 repo,
                 [
@@ -1797,6 +1864,8 @@ class GitSyncManager:
             "target_sha": payload["target_sha"],
             "status": [],
             "fast_forwarded": before_sha != final["head"],
+            "ignored_file_count": len(ignored_paths),
+            "ignored_paths_sha256": ignored_paths_hash,
         }
 
     def _verify_checkout(
