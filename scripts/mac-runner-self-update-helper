@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 HELPER_PATH = Path(__file__).resolve()
+RUNNER_STATUS_RETRY_SECONDS = 30
+RUNNER_STATUS_RETRY_INTERVAL = 1.0
 
 
 def sha256_hex(data: bytes) -> str:
@@ -235,16 +237,24 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
         if sqlite_integrity(db_path) != "ok":
             raise RuntimeError("SQLite integrity check failed after restart")
         stage = "runner_status_command"
-        status = subprocess.run(
-            [str(actual_runtime), str(app_dir / "runner.py"), "--config", str(config_path), "status"],
-            env=sanitized_env(),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if status.returncode != 0:
-            raise RuntimeError("new runner status command failed")
+        status_deadline = time.time() + RUNNER_STATUS_RETRY_SECONDS
+        while True:
+            status = subprocess.run(
+                [str(actual_runtime), str(app_dir / "runner.py"), "--config", str(config_path), "status"],
+                env=sanitized_env(),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if status.returncode == 0:
+                break
+            if time.time() >= status_deadline:
+                bounded_stderr = (status.stderr or "").strip().replace("\n", " ")[:256]
+                raise RuntimeError(
+                    f"new runner status command failed rc={status.returncode} stderr={bounded_stderr}"
+                )
+            time.sleep(RUNNER_STATUS_RETRY_INTERVAL)
         stage = "runner_status_payload"
         try:
             status_payload = json.loads(status.stdout)

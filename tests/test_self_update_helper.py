@@ -124,10 +124,11 @@ class SelfUpdateHelperTests(unittest.TestCase):
     def test_failed_new_status_restores_old_app_and_database(self) -> None:
         (self.candidate / "runner.py").write_text("raise SystemExit(2)\n", encoding="utf-8")
         plan = self._plan()
-        result = self._run_with_launchctl(plan)
+        with mock.patch.object(helper, "RUNNER_STATUS_RETRY_SECONDS", 0):
+            result = self._run_with_launchctl(plan)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_stage"], "runner_status_command")
-        self.assertEqual(result["error_message"], "new runner status command failed")
+        self.assertIn("new runner status command failed rc=2", result["error_message"])
         self.assertTrue(result["rollback_verified"])
         self.assertEqual((self.app / "runner.py").read_text(encoding="utf-8"), "print('old runner')\n")
         connection = sqlite3.connect(self.db)
@@ -135,6 +136,29 @@ class SelfUpdateHelperTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT value FROM proof").fetchone()[0], "old")
         finally:
             connection.close()
+
+    def test_transient_new_status_failure_is_retried(self) -> None:
+        (self.candidate / "runner.py").write_text(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "counter = Path(__file__).with_name('status-attempted')\n"
+            "if 'status' in sys.argv and not counter.exists():\n"
+            "    counter.write_text('1', encoding='utf-8')\n"
+            "    raise SystemExit(2)\n"
+            "payload = ({'status': 'VERIFYING', 'payload': {'target_sha': '"
+            + self.target
+            + "'}} if 'get' in sys.argv else {'runner': {'self_update': {'source_marker': '"
+            + self.target
+            + "', 'ready': True}}, 'queue': {'pending': 0, 'running': 1, 'retryable': 0}, "
+            "'git': {'worktrees': 0, 'dirty_outside_jobs': False}})\n"
+            "print(json.dumps(payload))\n",
+            encoding="utf-8",
+        )
+        plan = self._plan()
+        with mock.patch.object(helper, "RUNNER_STATUS_RETRY_INTERVAL", 0):
+            result = self._run_with_launchctl(plan)
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertTrue((self.app / "status-attempted").is_file())
 
     def test_candidate_tree_hash_rejects_symlinks_and_covers_file_mode(self) -> None:
         regular = self.candidate / "runner.py"
