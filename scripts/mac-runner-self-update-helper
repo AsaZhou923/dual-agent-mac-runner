@@ -147,6 +147,7 @@ def process_arguments(pid: int) -> list[str]:
 
 
 def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
+    stage = "preflight"
     app_dir = Path(plan["app_dir"]).resolve()
     candidate_dir = Path(plan["candidate_dir"]).resolve()
     candidate_sha256 = str(plan["candidate_sha256"])
@@ -183,14 +184,18 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
     app_backed_up = False
     app_replaced = False
     try:
+        stage = "swap_app"
         app_dir.rename(backup_dir)
         app_backed_up = True
         prepared_dir.rename(app_dir)
         app_replaced = True
+        stage = "source_marker"
         marker = app_dir / ".source-commit"
         if marker.read_text(encoding="utf-8").strip() != target_sha:
             raise RuntimeError("source marker did not match target")
+        stage = "restart_launchagent"
         subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{service_label}"], check=True, timeout=30)
+        stage = "wait_new_pid"
         deadline = time.time() + 45
         after_pid = None
         while time.time() < deadline:
@@ -200,6 +205,7 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
             time.sleep(1)
         if after_pid is None or after_pid == before_pid:
             raise RuntimeError("LaunchAgent did not restart with a new PID")
+        stage = "process_arguments"
         process_args = process_arguments(after_pid)
         actual_runtime = Path(process_args[0]).resolve() if process_args else Path("/")
         if (
@@ -210,6 +216,7 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
             or "serve" not in process_args
         ):
             raise RuntimeError("restarted LaunchAgent is not running the fixed Runner source/config")
+        stage = "runtime_version"
         runtime_version = subprocess.run(
             [str(actual_runtime), "--version"],
             env=sanitized_env(),
@@ -221,10 +228,13 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
         version_text = (runtime_version.stdout or runtime_version.stderr).strip()
         if runtime_version.returncode != 0 or plan["runtime_version"] not in version_text:
             raise RuntimeError("restarted LaunchAgent runtime version did not match the plan")
+        stage = "config_post_restart"
         if sha256_hex(config_path.read_bytes()) != plan["config_sha256"]:
             raise RuntimeError("config hash changed after self-update restart")
+        stage = "sqlite_post_restart"
         if sqlite_integrity(db_path) != "ok":
             raise RuntimeError("SQLite integrity check failed after restart")
+        stage = "runner_status_command"
         status = subprocess.run(
             [str(actual_runtime), str(app_dir / "runner.py"), "--config", str(config_path), "status"],
             env=sanitized_env(),
@@ -235,13 +245,16 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
         )
         if status.returncode != 0:
             raise RuntimeError("new runner status command failed")
+        stage = "runner_status_payload"
         try:
             status_payload = json.loads(status.stdout)
             self_update_status = status_payload["runner"]["self_update"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError("new runner status payload was invalid") from exc
+        stage = "runner_status_readiness"
         if self_update_status.get("source_marker") != target_sha or self_update_status.get("ready") is not True:
             raise RuntimeError("new runner status did not confirm self-update readiness")
+        stage = "isolated_verifying_queue"
         queue = status_payload.get("queue")
         git_status = status_payload.get("git")
         if (
@@ -253,6 +266,7 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
             or git_status.get("dirty_outside_jobs") is not False
         ):
             raise RuntimeError("new runner status did not confirm the isolated VERIFYING queue")
+        stage = "original_job_recovery"
         stored = subprocess.run(
             [
                 str(actual_runtime),
@@ -357,6 +371,8 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
             "target_sha": target_sha,
             "service_label": service_label,
             "error": type(exc).__name__,
+            "error_message": str(exc)[:512],
+            "failure_stage": stage,
             "rollback_errors": rollback_errors,
             "rollback_pid": rollback_pid,
             "rollback_verified": rollback_verified,
@@ -388,6 +404,8 @@ def main(argv: list[str]) -> int:
                 "schema": "mac-runner/self-update-result-v1",
                 "status": "failed",
                 "error": type(exc).__name__,
+                "error_message": str(exc)[:512],
+                "failure_stage": "plan_or_preflight",
             },
         )
         return 1

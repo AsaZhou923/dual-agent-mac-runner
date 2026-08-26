@@ -126,6 +126,8 @@ class SelfUpdateHelperTests(unittest.TestCase):
         plan = self._plan()
         result = self._run_with_launchctl(plan)
         self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_stage"], "runner_status_command")
+        self.assertEqual(result["error_message"], "new runner status command failed")
         self.assertTrue(result["rollback_verified"])
         self.assertEqual((self.app / "runner.py").read_text(encoding="utf-8"), "print('old runner')\n")
         connection = sqlite3.connect(self.db)
