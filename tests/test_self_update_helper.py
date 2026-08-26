@@ -177,16 +177,11 @@ class SelfUpdateHelperTests(unittest.TestCase):
         process_runtime = self.root / "Python"
         launcher.write_bytes(b"launcher")
         process_runtime.write_bytes(b"framework-runtime")
-        completed = subprocess.CompletedProcess(
-            [str(launcher)],
-            0,
-            stdout=f"{process_runtime}\n",
-            stderr="",
-        )
-        with mock.patch.object(helper.subprocess, "run", return_value=completed):
+        with mock.patch.object(helper, "process_arguments", return_value=[str(process_runtime)]):
             resolved, digest = helper.process_runtime_identity(
                 launcher,
                 hashlib.sha256(launcher.read_bytes()).hexdigest(),
+                123,
             )
         self.assertEqual(resolved, process_runtime.resolve())
         self.assertEqual(digest, hashlib.sha256(process_runtime.read_bytes()).hexdigest())

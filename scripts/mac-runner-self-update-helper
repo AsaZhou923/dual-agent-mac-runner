@@ -148,28 +148,19 @@ def process_arguments(pid: int) -> list[str]:
         raise RuntimeError("restarted LaunchAgent command was not parseable") from exc
 
 
-def process_runtime_identity(expected_runtime: Path, expected_sha256: str) -> tuple[Path, str]:
+def process_runtime_identity(
+    expected_runtime: Path,
+    expected_sha256: str,
+    running_pid: int,
+) -> tuple[Path, str]:
     if not expected_runtime.is_file() or sha256_hex(expected_runtime.read_bytes()) != expected_sha256:
         raise RuntimeError("planned Python launcher hash did not verify")
-    identity = subprocess.run(
-        [
-            str(expected_runtime),
-            "-I",
-            "-S",
-            "-c",
-            "import sys; print(sys._base_executable)",
-        ],
-        env=sanitized_env(),
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    if identity.returncode != 0 or not identity.stdout.strip():
-        raise RuntimeError("planned Python launcher did not report its process runtime")
-    process_runtime = Path(identity.stdout.strip()).resolve()
+    running_args = process_arguments(running_pid)
+    if not running_args:
+        raise RuntimeError("running LaunchAgent did not expose a process runtime")
+    process_runtime = Path(running_args[0]).resolve()
     if not process_runtime.is_file():
-        raise RuntimeError("planned Python process runtime is not a regular file")
+        raise RuntimeError("running Python process runtime is not a regular file")
     return process_runtime, sha256_hex(process_runtime.read_bytes())
 
 
@@ -191,6 +182,7 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
     expected_process_runtime, expected_process_sha256 = process_runtime_identity(
         expected_runtime,
         str(plan["runtime_sha256"]),
+        before_pid,
     )
     if not app_dir.is_dir() or not candidate_dir.is_dir():
         raise RuntimeError("app_dir and candidate_dir must exist")
