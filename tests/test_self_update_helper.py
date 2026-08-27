@@ -186,6 +186,35 @@ class SelfUpdateHelperTests(unittest.TestCase):
         self.assertEqual(resolved, process_runtime.resolve())
         self.assertEqual(digest, hashlib.sha256(process_runtime.read_bytes()).hexdigest())
 
+    def test_process_argument_checks_resolve_runner_and_config_aliases(self) -> None:
+        alias = self.root / "app-alias"
+        alias.symlink_to(self.app, target_is_directory=True)
+        runtime = Path(sys.executable).resolve()
+        checks = helper.process_argument_checks(
+            [str(runtime), str(alias / "runner.py"), "--config", str(alias / "config.toml"), "serve"],
+            runtime,
+            hashlib.sha256(runtime.read_bytes()).hexdigest(),
+            self.app / "runner.py",
+            self.config,
+        )
+        for name in ("runtime_path_ok", "runtime_hash_ok", "runner_arg_ok", "config_arg_ok", "serve_arg_ok"):
+            self.assertIs(checks[name], True)
+
+    def test_process_argument_checks_report_each_mismatch(self) -> None:
+        runtime = Path(sys.executable).resolve()
+        checks = helper.process_argument_checks(
+            [str(runtime), str(self.app / "other.py")],
+            runtime,
+            hashlib.sha256(runtime.read_bytes()).hexdigest(),
+            self.app / "runner.py",
+            self.config,
+        )
+        self.assertIs(checks["runtime_path_ok"], True)
+        self.assertIs(checks["runtime_hash_ok"], True)
+        self.assertIs(checks["runner_arg_ok"], False)
+        self.assertIs(checks["config_arg_ok"], False)
+        self.assertIs(checks["serve_arg_ok"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

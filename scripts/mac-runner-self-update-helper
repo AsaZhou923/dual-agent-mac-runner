@@ -164,6 +164,35 @@ def process_runtime_identity(
     return process_runtime, sha256_hex(process_runtime.read_bytes())
 
 
+def process_argument_checks(
+    process_args: list[str],
+    expected_runtime: Path,
+    expected_runtime_sha256: str,
+    expected_runner: Path,
+    expected_config: Path,
+) -> dict[str, bool | str]:
+    actual_runtime = Path(process_args[0]).resolve() if process_args else Path("/")
+    runtime_is_file = actual_runtime.is_file()
+    resolved_path_args: set[Path] = set()
+    for argument in process_args[1:]:
+        if not argument.startswith("/"):
+            continue
+        try:
+            resolved_path_args.add(Path(argument).resolve())
+        except OSError:
+            continue
+    return {
+        "runtime_path_ok": actual_runtime == expected_runtime,
+        "runtime_hash_ok": runtime_is_file
+        and sha256_hex(actual_runtime.read_bytes()) == expected_runtime_sha256,
+        "runner_arg_ok": expected_runner.resolve() in resolved_path_args,
+        "config_arg_ok": expected_config.resolve() in resolved_path_args,
+        "serve_arg_ok": "serve" in process_args,
+        "actual_runtime": str(actual_runtime),
+        "expected_runtime": str(expected_runtime),
+    }
+
+
 def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
     stage = "preflight"
     app_dir = Path(plan["app_dir"]).resolve()
@@ -230,15 +259,28 @@ def swap_app(plan: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("LaunchAgent did not restart with a new PID")
         stage = "process_arguments"
         process_args = process_arguments(after_pid)
-        actual_runtime = Path(process_args[0]).resolve() if process_args else Path("/")
-        if (
-            actual_runtime != expected_process_runtime
-            or sha256_hex(actual_runtime.read_bytes()) != expected_process_sha256
-            or str(app_dir / "runner.py") not in process_args
-            or str(config_path) not in process_args
-            or "serve" not in process_args
-        ):
-            raise RuntimeError("restarted LaunchAgent is not running the fixed Runner source/config")
+        argument_checks = process_argument_checks(
+            process_args,
+            expected_process_runtime,
+            expected_process_sha256,
+            app_dir / "runner.py",
+            config_path,
+        )
+        check_names = (
+            "runtime_path_ok",
+            "runtime_hash_ok",
+            "runner_arg_ok",
+            "config_arg_ok",
+            "serve_arg_ok",
+        )
+        if not all(argument_checks[name] is True for name in check_names):
+            detail = " ".join(f"{name}={str(argument_checks[name]).lower()}" for name in check_names)
+            raise RuntimeError(
+                "restarted LaunchAgent is not running the fixed Runner source/config: "
+                f"{detail} actual_runtime={argument_checks['actual_runtime']} "
+                f"expected_runtime={argument_checks['expected_runtime']}"
+            )
+        actual_runtime = Path(str(argument_checks["actual_runtime"]))
         stage = "runtime_version"
         runtime_version = subprocess.run(
             [str(actual_runtime), "--version"],
