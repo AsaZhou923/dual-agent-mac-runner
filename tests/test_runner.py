@@ -240,7 +240,10 @@ class RunnerTests(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "test@example.com",
         }
         (self.repo / "README.md").write_text("head\n", encoding="utf-8")
-        self._run("git", "-C", str(self.repo), "add", "README.md", env=env)
+        (self.repo / "schemas").mkdir()
+        for schema_name in ("job_schema.json", "result_schema.json"):
+            (self.repo / "schemas" / schema_name).write_bytes((self.app_dir / schema_name).read_bytes())
+        self._run("git", "-C", str(self.repo), "add", "README.md", "schemas", env=env)
         self._run("git", "-C", str(self.repo), "commit", "-m", "base", env=env)
         self.base_sha = self._git(self.repo, "rev-parse", "HEAD")
         self._run("git", "-C", str(self.repo), "push", "origin", "HEAD", env=env)
@@ -1499,6 +1502,14 @@ print(json.dumps({{"type": "final", "content": json.dumps(payload)}}))
         worker = subject._read_artifact(started, "worker-result")
         deploy_candidate = Path(worker["outcome"]["candidate_dir"])
         self.assertFalse((deploy_candidate / "validator-output.txt").exists())
+        self.assertEqual(
+            (deploy_candidate / "job_schema.json").read_bytes(),
+            (deploy_candidate / "schemas" / "job_schema.json").read_bytes(),
+        )
+        self.assertEqual(
+            (deploy_candidate / "result_schema.json").read_bytes(),
+            (deploy_candidate / "schemas" / "result_schema.json").read_bytes(),
+        )
         staged_plan = subject._read_artifact(started, "self-update-plan")
         self.assertEqual(staged_plan["candidate_sha256"], subject._tree_sha256(deploy_candidate))
         result_path = Path(worker["outcome"]["result_path"])

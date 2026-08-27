@@ -3936,6 +3936,7 @@ class Runner:
         finally:
             tar_path.unlink(missing_ok=True)
         (candidate_dir / ".source-commit").write_text(f"{payload['target_sha']}\n", encoding="utf-8")
+        self._materialize_preserved_schema_paths(candidate_dir)
         if not (candidate_dir / "runner.py").is_file():
             raise RunnerError("self_update_candidate_invalid", "Self-update candidate does not contain runner.py")
         if write_plan:
@@ -3951,6 +3952,27 @@ class Runner:
             }
             self._write_artifact(job, "self-update-plan", manifest)
         return candidate_dir
+
+    def _materialize_preserved_schema_paths(self, candidate_dir: Path) -> None:
+        app_dir = self.config.app_dir.resolve()
+        for configured_path, canonical_relative in (
+            (self.config.job_schema_path, Path("schemas/job_schema.json")),
+            (self.config.result_schema_path, Path("schemas/result_schema.json")),
+        ):
+            try:
+                configured_relative = configured_path.resolve().relative_to(app_dir)
+            except ValueError:
+                continue
+            destination = (candidate_dir / configured_relative).resolve()
+            if destination != candidate_dir and candidate_dir not in destination.parents:
+                raise RunnerError("artifact_path_escape", "Preserved schema path escaped the self-update candidate")
+            if destination.is_file():
+                continue
+            source = candidate_dir / canonical_relative
+            if not source.is_file():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
 
     def _start_self_update_helper(
         self,
