@@ -20,6 +20,13 @@ LOADER.exec_module(validator)
 
 
 class SelfUpdateCandidateValidatorTests(unittest.TestCase):
+    def test_app_root_schema_copies_match_canonical_schemas(self) -> None:
+        for schema_name in ("job_schema.json", "result_schema.json"):
+            self.assertEqual(
+                (ROOT / schema_name).read_bytes(),
+                (ROOT / "schemas" / schema_name).read_bytes(),
+            )
+
     def test_candidate_runner_can_migrate_and_open_private_database_copy(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             db_path = Path(temporary) / "runner.db"

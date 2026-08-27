@@ -43,6 +43,8 @@ def main() -> int:
     root = Path.cwd().resolve()
     required = [
         root / "runner.py",
+        root / "job_schema.json",
+        root / "result_schema.json",
         root / "schemas" / "job_schema.json",
         root / "schemas" / "result_schema.json",
         root / ".source-commit",
@@ -53,6 +55,10 @@ def main() -> int:
         return 2
     if not compileall.compile_file(str(root / "runner.py"), quiet=1):
         return 3
+    for schema_name in ("job_schema.json", "result_schema.json"):
+        if (root / schema_name).read_bytes() != (root / "schemas" / schema_name).read_bytes():
+            print(f"compatibility schema differs from canonical schema: {schema_name}", file=sys.stderr)
+            return 5
     for path in sorted((root / "schemas").glob("*.json")):
         json.loads(path.read_text(encoding="utf-8"))
     for path in sorted(root.rglob("*.toml")):

@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "attempt",
+    "status",
+    "route",
+    "findings",
+    "test_exit_code",
+    "diff_hash",
+    "commit_sha",
+    "duration_seconds",
+    "errors",
+    "supervisor",
+    "artifacts"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string"
+    },
+    "attempt": {
+      "type": "integer"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "DONE",
+        "FAILED",
+        "REJECTED",
+        "CANCELLED"
+      ]
+    },
+    "route": {
+      "type": "string",
+      "enum": [
+        "ornith",
+        "codex",
+        "sync",
+        "operational",
+        "privileged"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "title",
+          "detail"
+        ],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "error"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        }
+      },
+      "maxItems": 256
+    },
+    "test_exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "diff_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_path",
+        "before_sha256",
+        "after_sha256",
+        "loaded_sha256",
+        "unchanged"
+      ],
+      "properties": {
+        "config_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "before_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "after_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "loaded_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "unchanged": {
+          "type": "boolean"
+        }
+      }
+    },
+    "commit_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 2000
+      },
+      "maxItems": 256
+    },
+    "supervisor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "acceptance"
+      ],
+      "properties": {
+        "decision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "route",
+            "reason"
+          ],
+          "properties": {
+            "route": {
+              "type": "string",
+              "enum": [
+                "ornith",
+                "codex",
+                "sync",
+                "operational",
+                "privileged"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            }
+          }
+        },
+        "acceptance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accepted",
+            "summary",
+            "errors"
+          ],
+          "properties": {
+            "accepted": {
+              "type": "boolean"
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4000
+            },
+            "errors": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 1000
+              },
+              "maxItems": 64
+            }
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_decision",
+        "worker_result",
+        "tests",
+        "acceptance",
+        "result"
+      ],
+      "properties": {
+        "route_decision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "worker_result": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "tests": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "acceptance": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "result": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
+    }
+  }
+}
